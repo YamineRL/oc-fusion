@@ -1,7 +1,10 @@
 // Fusion control panel. Edit here, or use `bin/oc-fusion <knob> <value>`.
 // Read at opencode start; restart to apply.
 {
-  // Lead model. Does the thinking and the deciding.
+  // Lead model. Does the thinking and the deciding. The savings in this
+  // harness come from the sidekick tier, never from economizing here:
+  // glm-5.3-class is the floor; fable/astra/opus are the on-par-with-Fusion
+  // configs. Flash-class models belong in "sidekick", not here.
   //   glm       zai/glm-5.3          $0.70/$2.20   efforts: low high max
   //   glm-flash zai/glm-5.3-flash    $0.015/$0.05  efforts: low high max
   //   fable     claude-fable-5-1     $10/$50       + medium xhigh

@@ -30,9 +30,9 @@ local model. You get the best results by working *with* that split:
 
 ```
 oc-fusion status                    # what's live
-oc-fusion base glm|fable|...        # lead; glm is the default and cheapest
+oc-fusion base glm|fable|...        # lead; glm-5.3-class is the floor, fable/astra/opus are on-par
 oc-fusion critic local|flash|lead   # who reviews diffs — see README
-oc-fusion speed fast                # cheaper/faster session: -1 reasoning notch
+oc-fusion speed fast                # faster session: -1 reasoning notch on the lead
 oc-fusion escalation advise|run|fable
 ```
 

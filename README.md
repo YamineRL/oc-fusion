@@ -3,10 +3,14 @@
 A two-tier coding harness for [opencode](https://opencode.ai), built around
 local inference you already own.
 
-A cheap, capable lead model does the thinking. A model on your own GPU — or a
-cheap flash-class API model — does the reading, searching, mechanical editing,
-and test-running. What the lead cannot crack goes to a Claude Code
+A strong lead model does the thinking — frontier-class in the on-par
+configuration, GLM-5.3-class as the sensible floor. A model on your own GPU —
+or a cheap flash-class API model — does the reading, searching, mechanical
+editing, and test-running. What the lead cannot crack goes to a Claude Code
 subscription you already pay for, instead of a per-token frontier fallback.
+
+The savings live in the sidekick, never in the lead. That is the whole
+design: strongest affordable brain, cheapest possible hands.
 
 Every knob is honest about what it does, and every claim in this README was
 measured on the reference setup (a 27B-class quantized model on a 16 GB card
@@ -18,16 +22,28 @@ Most tokens in a coding session are spent *reading* things, not reasoning
 about them. This is the pattern commercial agent products converged on in
 2026 — notably Devin's Fusion, which pairs a frontier lead with a cheap
 sidekick and bills per token for both. Artificial Analysis measured the
-effect there: the lead alone cost $12.40/task, while lead + sidekick hit the
-same index score at $7.90.
+effect there: Fable 5.1 alone cost $12.40/task, while Fable 5.1 + SWE-2 hit
+the same index score at $7.90.
 
 oc-fusion is that shape with a different cost structure:
 
-|          | Devin Fusion       | oc-fusion                       | Cost (in/out per M) |
-|----------|--------------------|---------------------------------|---------------------|
-| Lead     | Claude Fable 5.1   | your pick (e.g. a mid-tier model) | e.g. $0.70 / $2.20 |
-| Sidekick | SWE-2 (medium)     | your own GGUF, or a flash-class API model | **$0** or ~$0.03/$0.07 |
-| Escalation | (none)           | Claude Code (subscription)      | $0 gateway          |
+|          | Devin Fusion       | oc-fusion, on-par               | oc-fusion, frugal | Cost (in/out per M) |
+|----------|--------------------|---------------------------------|-------------------|---------------------|
+| Lead     | Claude Fable 5.1   | same class (Fable / Opus / Astra) | GLM-5.3 (the floor) | $0.70/$2.20 … $10/$50 |
+| Sidekick | SWE-2 (medium)     | your own GGUF, or a flash-class API model | same | **$0** or ~$0.03/$0.07 |
+| Escalation | (none)           | Claude Code (subscription)      | same              | $0 gateway          |
+
+Two configurations, one harness:
+
+- **On-par with Fusion**: `oc-fusion base fable` (or astra/opus). Same lead
+  class Fusion uses, the subscription-instead-of-frontier escalation, and a
+  sidekick that bills $0 because it is your own hardware. This is the config
+  to reach for when the task is hard and you want Fusion's shape at a
+  fraction of Fusion's bill.
+- **Frugal** (default): `oc-fusion base glm`. GLM-5.3 is the floor — below
+  it you lose the "strong lead" property the architecture depends on, and
+  the savings should come from the sidekick instead. Cheap flash-class
+  models are for the sidekick tier, not the lead.
 
 The sidekick is where the money is. If you run a local inference server at
 all, the marginal cost of a sidekick token is zero — and the harness
