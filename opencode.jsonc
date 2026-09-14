@@ -1,0 +1,136 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+
+  // The lead agent. The fusion plugin rewrites model/variant from fusion.jsonc
+  // at load, so this is only the fallback if the plugin is disabled.
+  "default_agent": "fusion",
+  "model": "merge-gateway/zai/glm-5.3",
+
+  // Titles and other throwaway calls. Deliberately NOT the local model: every
+  // new session would then wake the GPU to name a chat. glm-5.3-flash is
+  // $0.015/$0.05 per M, so this is fractions of a cent a day, and it keeps the
+  // shared card free for work you actually asked for.
+  "small_model": "merge-gateway/zai/glm-5.3-flash",
+
+  "plugin": ["./.opencode/plugin/fusion.js"],
+
+  // Fusion's efficiency comes from fewer, fatter round trips.
+  "experimental": {
+    "batch_tool": true,
+    "primary_tools": ["task", "escalate"]
+  },
+
+  // Subagents must not spawn subagents: on --parallel 1 that deadlocks the
+  // single local slot behind itself.
+  "subagent_depth": 1,
+
+  "compaction": {
+    "auto": true,
+    "prune": true,
+    "tail_turns": 8,
+    "reserved": 8000
+  },
+
+  "tool_output": {
+    "max_lines": 1200,
+    "max_bytes": 40000
+  },
+
+  "provider": {
+    "llamacpp": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "llama.cpp (local)",
+      "options": {
+        "baseURL": "http://127.0.0.1:8080/v1",
+        "apiKey": "{file:~/.config/llama-server/api-key}"
+      },
+      "models": {
+        // "id" is a placeholder. The fusion plugin overwrites every local
+        // alias id at load with the wire id of whatever your llama-server has
+        // resident (its --alias, or the .gguf basename) -- so the harness
+        // always talks to the model your server is actually running. Pin it
+        // instead with "local_model" in fusion.jsonc if you want it fixed.
+        // All aliases share one id on purpose: llama-server --models-max 1
+        // unloads the resident model if asked for another, and identical ids
+        // across profiles make that impossible.
+        "fusion-sidekick": {
+          "id": "local",
+          "name": "Sidekick (medium effort)",
+          "tool_call": true,
+          "reasoning": true,
+          "temperature": false,
+          "options": { "chat_template_kwargs": { "reasoning_effort": "medium" } },
+          "limit": { "context": 44000, "output": 16384 },
+          "cost": { "input": 0, "output": 0 }
+        },
+        "fusion-sidekick-fast": {
+          "id": "local",
+          "name": "Sidekick (low effort)",
+          "tool_call": true,
+          "reasoning": true,
+          "temperature": false,
+          "options": { "chat_template_kwargs": { "reasoning_effort": "low" } },
+          "limit": { "context": 44000, "output": 8192 },
+          "cost": { "input": 0, "output": 0 }
+        },
+        "fusion-sidekick-deep": {
+          "id": "local",
+          "name": "Sidekick (high effort)",
+          "tool_call": true,
+          "reasoning": true,
+          "temperature": false,
+          "options": { "chat_template_kwargs": { "reasoning_effort": "high" } },
+          "limit": { "context": 44000, "output": 32768 },
+          "cost": { "input": 0, "output": 0 }
+        }
+      }
+    }
+  },
+
+  "agent": {
+    "fusion": {
+      "description": "Lead. Frontier model that plans, decides, and delegates bulk work to the sidekick.",
+      "mode": "primary",
+      "model": "merge-gateway/zai/glm-5.3",
+      "variant": "high",
+      "prompt": "{file:./prompts/fusion.md}",
+      "steps": 400
+    },
+    "scout": {
+      "description": "Read-only explorer on the local model. Use for finding files, tracing call sites, summarizing how something works. Returns findings, never patches.",
+      "mode": "subagent",
+      "model": "llamacpp/fusion-sidekick",
+      "prompt": "{file:./prompts/scout.md}",
+      "steps": 60,
+      "permission": {
+        "edit": "deny",
+        "write": "deny",
+        "bash": { "*": "deny", "git log*": "allow", "git diff*": "allow", "git show*": "allow", "rg *": "allow", "grep *": "allow", "fd *": "allow", "ls *": "allow", "cat *": "allow", "sed -n *": "allow", "wc *": "allow", "head *": "allow", "tail *": "allow" }
+      }
+    },
+    "grunt": {
+      "description": "Mechanical editor on the local model. Use for well-specified changes: renames, applying a described patch, wiring boilerplate, fixing a failing test whose cause is known.",
+      "mode": "subagent",
+      "model": "llamacpp/fusion-sidekick",
+      "prompt": "{file:./prompts/grunt.md}",
+      "steps": 80
+    },
+    "oracle": {
+      "description": "Frontier model at max reasoning. Use ONLY for a genuinely hard, isolated problem: a subtle bug, a design trade-off, an algorithm. Costs real money per call.",
+      "mode": "subagent",
+      "model": "merge-gateway/anthropic/claude-fable-5-1",
+      "variant": "max",
+      "prompt": "{file:./prompts/oracle.md}",
+      "steps": 40,
+      "permission": { "edit": "deny", "write": "deny" }
+    },
+    "critic": {
+      "description": "Reviews a diff for correctness before you call the work done.",
+      "mode": "subagent",
+      "model": "llamacpp/fusion-sidekick-deep",
+      "prompt": "{file:./prompts/critic.md}",
+      "steps": 40,
+      "permission": { "edit": "deny", "write": "deny" }
+    }
+  }
+}

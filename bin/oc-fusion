@@ -1,0 +1,224 @@
+#!/usr/bin/env bash
+# Fusion control panel CLI. Edits fusion.jsonc in place.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PROFILE="$ROOT/fusion.jsonc"
+UNIT="$HOME/.config/systemd/user/llama-server.service"
+
+BASES="glm glm-flash fable astra sol opus"
+SIDEKICKS="local local-fast local-deep glm deepseek"
+CRITICS="local flash lead"
+SPEEDS="normal fast"
+EFFORTS="low medium high xhigh max"
+GUARDS="strict warn off"
+ESCALATIONS="advise run fable"
+
+die() { echo "oc-fusion: $*" >&2; exit 1; }
+
+in_list() { local n=$1; shift; for x in $*; do [ "$x" = "$n" ] && return 0; done; return 1; }
+
+# Rewrite one top-level "key": value pair, preserving comments and layout.
+set_key() {
+  local key=$1 val=$2 quoted=$3
+  python3 - "$PROFILE" "$key" "$val" "$quoted" <<'PY'
+import re, sys
+path, key, val, quoted = sys.argv[1:5]
+s = open(path).read()
+new = f'"{val}"' if quoted == "yes" else val
+# Match a JSON scalar exactly, not "everything up to a comma". The loose
+# version ate a trailing // comment on a value line (and silently failed on
+# a line that had both a comma and a comment).
+VAL = r'"(?:[^"\\]|\\.)*"|true|false|null|-?\d+(?:\.\d+)?'
+pat = re.compile(
+    rf'^(\s*"{re.escape(key)}"\s*:\s*)(?:{VAL})(\s*,?)(\s*(?://.*)?)$', re.M)
+if not pat.search(s):
+    sys.exit(f"oc-fusion: no \"{key}\" key in {path}")
+s = pat.sub(lambda m: f"{m.group(1)}{new}{m.group(2)}{m.group(3)}", s, count=1)
+open(path, "w").write(s)
+PY
+  echo "oc-fusion: $key = $val"
+  echo "oc-fusion: restart opencode to apply."
+}
+
+get_key() {
+  python3 - "$PROFILE" "$1" <<'PY'
+import re, sys
+s = open(sys.argv[1]).read()
+VAL = r'"(?:[^"\\]|\\.)*"|true|false|null|-?\d+(?:\.\d+)?'
+m = re.search(rf'^\s*"{re.escape(sys.argv[2])}"\s*:\s*({VAL})', s, re.M)
+print(m.group(1).strip('"') if m else "?")
+PY
+}
+
+# Passive: reads the child server's cmdline. Never touches an inference endpoint.
+resident() {
+  ps -eo args= 2>/dev/null | awk '/llama-server/ && /--alias/ {
+    for (i=1;i<=NF;i++) if ($i=="--alias") { print $(i+1); exit }
+  }'
+}
+
+usage() {
+  cat <<EOF
+usage: oc-fusion <command>
+
+  status                 show the current panel and the live local server
+  base       <$(echo $BASES | tr ' ' '|')>
+  sidekick   <$(echo $SIDEKICKS | tr ' ' '|')>
+  critic     <$(echo $CRITICS | tr ' ' '|')>
+  speed      <$(echo $SPEEDS | tr ' ' '|')>
+  reasoning  <$(echo $EFFORTS | tr ' ' '|')>
+  escalation <$(echo $ESCALATIONS | tr ' ' '|')>
+  oracle     <$(echo $BASES | tr ' ' '|')>   (only used when escalation=fable)
+  guard      <$(echo $GUARDS | tr ' ' '|')>
+  compress   <on|off>
+  usage                 aggregate .fusion/usage.jsonl (per-agent tokens + cost)
+  doctor                 check the config against the llama-server unit
+EOF
+}
+
+cmd=${1-status}
+case "$cmd" in
+  status)
+    echo "lead      $(get_key base)   reasoning $(get_key reasoning)   speed $(get_key speed)"
+    echo "sidekick  $(get_key sidekick)"
+    echo "critic    $(get_key critic)"
+    esc=$(get_key escalation)
+    case "$esc" in
+      advise) echo "escalate  advise   -> handoff brief for Claude Code (no spend)" ;;
+      run)    echo "escalate  run      -> claude -p (subscription, no gateway spend)" ;;
+      fable)  echo "escalate  fable    -> paid oracle subagent: $(get_key oracle) at max" ;;
+      *)      echo "escalate  $esc   (unknown)" ;;
+    esac
+    echo "guard     $(get_key guard)   compress $(get_key compress_tool_output)"
+    echo
+    local_res=$(resident || true)
+    echo "resident  ${local_res:-<nothing loaded>}"
+    if command -v systemctl >/dev/null; then
+      echo "service   llama-server.service: $(systemctl --user is-active llama-server.service 2>/dev/null || echo unknown)"
+    fi
+    ;;
+  base|oracle)
+    [ $# -ge 2 ] || die "usage: oc-fusion $cmd <$(echo $BASES | tr ' ' '|')>"
+    in_list "$2" $BASES || die "unknown model \"$2\". Known: $BASES"
+    set_key "$cmd" "$2" yes ;;
+  sidekick)
+    [ $# -ge 2 ] || die "usage: oc-fusion sidekick <$(echo $SIDEKICKS | tr ' ' '|')>"
+    in_list "$2" $SIDEKICKS || die "unknown sidekick \"$2\". Known: $SIDEKICKS"
+    set_key sidekick "$2" yes ;;
+  critic)
+    [ $# -ge 2 ] || die "usage: oc-fusion critic <$(echo $CRITICS | tr ' ' '|')>"
+    in_list "$2" $CRITICS || die "unknown critic \"$2\". Known: $CRITICS"
+    set_key critic "$2" yes ;;
+  speed)
+    [ $# -ge 2 ] || die "usage: oc-fusion speed <normal|fast>"
+    in_list "$2" $SPEEDS || die "unknown speed \"$2\". Known: $SPEEDS"
+    set_key speed "$2" yes ;;
+  reasoning)
+    [ $# -ge 2 ] || die "usage: oc-fusion reasoning <$(echo $EFFORTS | tr ' ' '|')>"
+    in_list "$2" $EFFORTS || die "unknown level \"$2\". Known: $EFFORTS"
+    set_key reasoning "$2" yes ;;
+  escalation)
+    [ $# -ge 2 ] || die "usage: oc-fusion escalation <$(echo $ESCALATIONS | tr ' ' '|')>"
+    in_list "$2" $ESCALATIONS || die "unknown escalation \"$2\". Known: $ESCALATIONS"
+    set_key escalation "$2" yes ;;
+  guard)
+    [ $# -ge 2 ] || die "usage: oc-fusion guard <strict|warn|off>"
+    in_list "$2" $GUARDS || die "unknown guard \"$2\". Known: $GUARDS"
+    set_key guard "$2" yes ;;
+  compress)
+    [ $# -ge 2 ] || die "usage: oc-fusion compress <on|off>"
+    case "$2" in on) v=true;; off) v=false;; *) die "use on or off";; esac
+    set_key compress_tool_output "$v" no ;;
+  doctor)
+    [ -f "$UNIT" ] || die "no llama-server unit at $UNIT"
+    ctx=$(grep -oP '(?<=-c )\d+' "$UNIT" | head -1)
+    par=$(grep -oP '(?<=--parallel )\d+' "$UNIT" | head -1)
+    mmax=$(grep -oP '(?<=--models-max )\d+' "$UNIT" | head -1)
+    port=$(grep -oP '(?<=--port )\d+' "$UNIT" | head -1)
+    echo "unit      ctx=$ctx parallel=$par models-max=$mmax port=$port"
+    declared=$(grep -oP '"context":\s*\K\d+' "$ROOT/opencode.jsonc" | sort -un | tr '\n' ' ')
+    echo "declared  local context: $declared"
+    for d in $declared; do
+      if [ "$d" -ge "$ctx" ]; then
+        echo "  WARN: declared $d >= server $ctx; opencode may pack a prompt the server rejects."
+      fi
+    done
+    base_url=$(grep -oP 'baseURL":\s*"\K[^"]+' "$ROOT/opencode.jsonc" | head -1)
+    echo "baseURL   $base_url"
+    case "$base_url" in
+      *":$port/"*) echo "  ok: baseURL port matches the unit." ;;
+      *) echo "  WARN: baseURL does not use the unit's port ($port)." ;;
+    esac
+    r=$(resident || true)
+    echo "resident  ${r:-<nothing loaded>}"
+    if [ -n "$r" ]; then
+      # The plugin stamps the resident wire id onto the local aliases at
+      # load, so any pinned "id" here is a stale pin, not the source of truth.
+      pinned=$(grep -oP '"id":\s*"\K[^"]+' "$ROOT/opencode.jsonc" | sort -u | tr '\n' ' ')
+      for p in $pinned; do
+        [ "$p" != "$r" ] && [ "$p" != "local" ] && echo "  WARN: pinned \"$p\" differs from resident \"$r\"; the plugin will use the resident model."
+      done
+    else
+      echo "  WARN: nothing resident; local agents will fail until a model is loaded."
+    fi
+    [ "$mmax" = "1" ] && echo "note      models-max=1: only one local model can be resident at a time."
+    [ "$par" = "1" ] && echo "note      parallel=1: concurrent local calls queue rather than overlap."
+    ;;
+  usage)
+    # Aggregate .fusion/usage.jsonl (see block above for the implementation).
+    f="$PWD/.fusion/usage.jsonl"
+    if [ ! -f "$f" ]; then
+      echo "no usage yet at $f"
+      exit 0
+    fi
+    python3 - "$f" "$(get_key base)" <<'PY'
+import json, sys
+from collections import defaultdict
+
+path, base = sys.argv[1], sys.argv[2]
+# Lead rates ($/M in, $/M out) -- keep in step with the table in fusion.js.
+LEAD = {"glm": (0.70, 2.20), "glm-flash": (0.015, 0.05),
+        "fable": (10, 50), "astra": (10, 50), "sol": (5, 30), "opus": (5, 25)}
+rin, rout = LEAD.get(base, LEAD["glm"])
+
+rows = []
+with open(path) as fh:
+    for line in fh:
+        line = line.strip()
+        if not line: continue
+        try: rows.append(json.loads(line))
+        except json.JSONDecodeError: pass
+
+if not rows:
+    print("usage log exists but has no readable lines"); sys.exit(0)
+
+by_agent = defaultdict(lambda: [0,0,0,0.0,0])  # in, out, reasoning, cost, msgs
+for r in rows:
+    a = by_agent[r.get("agent", "unknown")]
+    a[0] += r.get("in", 0); a[1] += r.get("out", 0)
+    a[2] += r.get("reasoning", 0); a[3] += r.get("cost", 0.0); a[4] += 1
+
+def fmt(n):
+    return f"{n/1e6:.2f}M" if n >= 1e6 else f"{n/1e3:.1f}k"
+
+total_cost = sum(v[3] for v in by_agent.values())
+shadow_in  = sum(v[0] for k, v in by_agent.items() if k != "fusion")
+shadow_out = sum(v[1] + v[2] for k, v in by_agent.items() if k != "fusion")
+shadow = (shadow_in * rin + shadow_out * rout) / 1e6
+
+print(f"{'agent':<10} {'msgs':>5} {'in':>8} {'out':>8} {'reasoning':>9} {'cost':>8}")
+for k in sorted(by_agent, key=lambda k: -by_agent[k][3]):
+    v = by_agent[k]
+    print(f"{k:<10} {v[4]:>5} {fmt(v[0]):>8} {fmt(v[1]):>8} {fmt(v[2]):>9} ${v[3]:>7.3f}")
+print(f"{'TOTAL':<10} {'':>5} {'':>8} {'':>8} {'':>9} ${total_cost:>7.3f}")
+print()
+print(f"lead model rates ({base}): ${rin}/${rout} per M in/out")
+print(f"delegated tokens (non-lead): {fmt(shadow_in)} in / {fmt(shadow_out)} out+reasoning")
+print(f"shadow cost if billed at lead rates: ${shadow:.3f}")
+print("(upper bound on what delegation saved; local agents actually cost $0)")
+PY
+    ;;
+  -h|--help|help) usage ;;
+  *) usage; exit 1 ;;
+esac

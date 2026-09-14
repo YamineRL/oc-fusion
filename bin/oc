@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Run opencode with the Fusion harness, in whatever directory you are in.
+#
+#   oc                 interactive, in the current project
+#   oc run "..."       one-shot
+#
+# The harness config lives with this script, so the lead, the local sidekick,
+# the agents and the plugin come along into any repo you point it at. The
+# control panel is the harness's own fusion.jsonc unless the project you are
+# in has one of its own, or FUSION_PROFILE names a third.
+set -euo pipefail
+HARNESS="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+export OPENCODE_CONFIG="$HARNESS/opencode.jsonc"
+exec opencode "$@"

@@ -1,0 +1,36 @@
+# Example llama-server unit for the oc-fusion harness.
+#
+# Copy to ~/.config/systemd/user/llama-server.service and edit the paths.
+# `systemctl --user daemon-reload && systemctl --user enable --now llama-server`
+#
+# The harness parses this unit at startup and adapts to it (context ceiling,
+# port, parallelism). Flags that matter to the harness are commented; the
+# rest are reasonable defaults for a single-GPU setup.
+#
+# Requirements for the sidekick model: a tool-calling reasoning model whose
+# chat template accepts reasoning_effort through chat_template_kwargs
+# (--jinja). Any GGUF that meets that works; the harness discovers the wire
+# id from the running server at load.
+
+[Unit]
+Description=llama.cpp server for oc-fusion sidekick
+After=network.target
+
+[Service]
+ExecStart=/usr/local/bin/llama-server \
+  --model /path/to/your/model.gguf \
+  --alias my-sidekick \
+  --host 127.0.0.1 \
+  --port 8080 \
+  --api-key-file %h/.config/llama-server/api-key \
+  -c 45056 \
+  --parallel 1 \
+  --models-max 1 \
+  --jinja \
+  --reasoning-format deepseek \
+  --chat-template-kwargs {"reasoning_effort":"medium"} \
+  --sleep-idle-seconds 900
+Restart=on-failure
+
+[Install]
+WantedBy=default.target

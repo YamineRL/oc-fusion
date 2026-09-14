@@ -1,0 +1,85 @@
+// Fusion control panel. Edit here, or use `bin/oc-fusion <knob> <value>`.
+// Read at opencode start; restart to apply.
+{
+  // Lead model. Does the thinking and the deciding.
+  //   glm       zai/glm-5.3          $0.70/$2.20   efforts: low high max
+  //   glm-flash zai/glm-5.3-flash    $0.015/$0.05  efforts: low high max
+  //   fable     claude-fable-5-1     $10/$50       + medium xhigh
+  //   astra     gpt-6-astra          $10/$50       + medium xhigh
+  //   sol       gpt-5.6-sol          $5/$30        + none medium xhigh
+  //   opus      claude-opus-5        $5/$25        + medium xhigh
+  "base": "glm",
+
+  // Lead reasoning level: low | medium | high | xhigh | max
+  // Clamped to what the chosen base actually offers, always to the nearest
+  // level at or BELOW the request, so it never silently costs more than you
+  // asked for. On glm (low/high/max) that means xhigh -> high and, note,
+  // medium -> low; ask for "high" if you want glm's middle setting.
+  "reasoning": "high",
+  // Where the lead goes when it cannot crack something, via the `escalate`
+  // tool. Claude Code is a subscription you already pay for, so it costs no
+  // gateway balance; Fable does.
+  //   advise  write a handoff brief, print the exact `claude` command, stop
+  //   run     invoke `claude -p` directly and return its answer (asks first)
+  //   fable   enable the paid `oracle` subagent instead
+  "escalation": "advise",
+  // Only used when escalation is "fable": which frontier model the `oracle`
+  // subagent runs, always at max effort. Same names as `base`.
+  "oracle": "fable",
+
+  // Only used when escalation is "run": pass a specific model to `claude -p`.
+  // null uses whatever Claude Code is configured to use.
+  "claude_model": null,
+
+  // Sidekick. Absorbs the bulk work.
+  //   local       the resident local model, medium effort   free
+  //   local-fast  same weights, low effort                  free
+  //   local-deep  same weights, high effort                 free
+  //   glm         zai/glm-5.3-flash                         $0.015/$0.05
+  //   deepseek    deepseek-v4-flash                         $0.035/$0.07
+  "sidekick": "local",
+
+  // Pin the local wire id (what llama-server knows the model as). null =
+  // discover it from the running server at load, which is the default
+  // because it can never ask for a model that is not resident.
+  "local_model": null,
+
+  // reasoning_effort injected per local agent (chat-template levels; a
+  // template throws on one it does not know, so adjust to your model).
+  // Delete an entry to fall back to the server's unit-level default.
+  "local_efforts": { "scout": "low", "grunt": "medium", "critic": "high" },
+
+  // Who reviews diffs before work is called done. Independent of "sidekick":
+  // the default local critic is the weakest model in the fleet auditing the
+  // strongest editor, which is backwards for subtle edits.
+  //   local  the resident local model, high effort (free, today's behavior)
+  //   flash  zai/glm-5.3-flash low effort (~fractions of a cent per review)
+  //   lead   the lead model itself at low effort (self-review, sub-cent at
+  //          glm prices; strongest reviewer available)
+  "critic": "local",
+
+  // normal | fast
+  // fast = one notch less reasoning and a tighter step budget. Where the
+  // gateway publishes a vendor `-fast` twin it is used too, but it does not
+  // publish one for glm-5.3, fable, astra, sol or opus-5.
+  "speed": "normal",
+
+  // Protect the resident llama.cpp model from eviction: strict | warn | off
+  // llama-server runs --models-max 1, so naming a non-resident model unloads
+  // whatever is loaded, mid-generation.
+  //   strict  refuse the request
+  //   warn    allow, but log loudly first
+  "guard": "warn",
+
+  // Let the free local model summarize oversized tool output before it
+  // reaches the paid lead. Head (2000 chars) and tail (1000) stay verbatim.
+  //
+  // This only applies to output that is large but INTACT. Anything big enough
+  // that opencode truncated it and wrote the full text to a file takes the
+  // better route instead: the lead is told to send scout at the file, which is
+  // lossless and free. So the useful band is between this threshold and
+  // tool_output.max_bytes (40000 in opencode.jsonc); a threshold at or above
+  // max_bytes turns compression off in practice.
+  "compress_tool_output": true,
+  "compress_threshold": 25000
+}
