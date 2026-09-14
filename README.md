@@ -319,4 +319,4 @@ affiliated with Cognition.
 
 ## License
 
-MIT — see LICENSE.
+GPL-3.0 — see LICENSE.
