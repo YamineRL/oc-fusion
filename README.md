@@ -8,6 +8,9 @@ configuration, GLM-5.3-class as the sensible floor. A model on your own GPU —
 or a cheap flash-class API model — does the reading, searching, mechanical
 editing, and test-running. What the lead cannot crack goes to a Claude Code
 subscription you already pay for, instead of a per-token frontier fallback.
+And under both tiers, a local [Graft](https://github.com/trailhq/Graft) graph
+maps every project — symbols, call edges, exact file:line — so no agent
+re-explores the repo from zero on each task.
 
 The savings live in the sidekick, never in the lead. That is the whole
 design: strongest affordable brain, cheapest possible hands.
@@ -31,6 +34,7 @@ oc-fusion is that shape with a different cost structure:
 |----------|--------------------|---------------------------------|-------------------|---------------------|
 | Lead     | Claude Fable 5.1   | same class (Fable / Opus / Astra) | GLM-5.3 (the floor) | $0.70/$2.20 … $10/$50 |
 | Sidekick | SWE-2 (medium)     | your own GGUF, or a flash-class API model | same | **$0** or ~$0.03/$0.07 |
+| Repo map | (closed)           | Graft, local per-repo graph      | same              | **$0**              |
 | Escalation | (none)           | Claude Code (subscription)      | same              | $0 gateway          |
 
 Two configurations, one harness:
@@ -44,6 +48,14 @@ Two configurations, one harness:
   it you lose the "strong lead" property the architecture depends on, and
   the savings should come from the sidekick instead. Cheap flash-class
   models are for the sidekick tier, not the lead.
+- **Free lead**: `oc-fusion base union-alpha`. OpenCode Zen's stealth model
+  built for agentic coding, released 2026-09-16, $0 in / $0 out. It
+  advertises no reasoning levels — the model manages its own effort, so the
+  `reasoning` knob is ignored for it (the harness sends no variant). A
+  stealth model has no public benchmarks: treat it as an experiment while
+  Zen keeps it free, not as a floor replacement. Use it when the lead
+  should cost nothing; flip back to `glm` or `fable` when it isn't
+  cutting it.
 
 The sidekick is where the money is. If you run a local inference server at
 all, the marginal cost of a sidekick token is zero — and the harness
@@ -61,12 +73,17 @@ model that isn't loaded.
 | `oracle` | frontier| **off by default.** Only exists when `escalation` is `fable` |
 
 `scout` is where the savings are. The lead never burns its own context reading
-a 3000-line file to find one function.
+a 3000-line file to find one function — and with a `graft/` index in the
+project, it often skips the file read entirely: the graph answers with exact
+file:line and the crux lines inline, so a find/trace becomes one tool call
+instead of a browse.
 
 `critic` is set by its own knob (`local | flash | lead`), independent of the
 sidekick. The default local critic can be the weakest model in your fleet
 auditing the strongest editor — backwards for subtle edits. `lead` re-reviews
-at low effort, typically well under a cent per review.
+at low effort, typically well under a cent per review. On a lead with no
+reasoning levels (union-alpha) `critic lead` self-reviews with no variant —
+same model, its default effort.
 
 ## Install
 
@@ -75,6 +92,7 @@ at low effort, typically well under a cent per review.
 ```
 git clone https://github.com/YamineRL/oc-fusion.git
 cd oc-fusion && npm --prefix .opencode install
+npm install -g @nanonets/graft
 ```
 
 Then follow "Running it".
@@ -92,6 +110,8 @@ into ~/oc-fusion (clone if the directory does not exist; pull if it does).
 Then:
 
 1. Run `npm --prefix ~/oc-fusion/.opencode install` and confirm it succeeds.
+2. Install the repo-graph layer: `npm install -g @nanonets/graft` (Node 20+).
+   It is part of the harness, not an extra.
 2. Find my llama-server setup:
    - Look for a systemd user unit named llama-server.service under
      ~/.config/systemd/user/ (also check `systemctl --user list-units |
@@ -120,7 +140,8 @@ Then:
    <fish|bash|zsh>: use fish_add_path for fish, or append the export to the
    right rc file for bash/zsh.
 6. Verify: run `oc-fusion doctor` and show me the output. It should report
-   the port, the context ceiling, and the resident model without warnings.
+   the port, the context ceiling, the resident model, and a graft line
+   without warnings.
 7. Do not start a session yet. Report what you did, what you guessed, and
    what I should change (especially the lead model in fusion.jsonc "base"
    if I do not want the default).
@@ -173,6 +194,7 @@ oc-fusion escalation advise|run|fable
 oc-fusion oracle <model>         # only when escalation=fable
 oc-fusion guard strict|warn|off
 oc-fusion compress on|off
+oc-fusion graft <cmd> [args...]  # the repo graph, offline-wrapped (see Graft)
 oc-fusion usage                  # per-agent token + cost accounting
 oc-fusion doctor                 # check the config against the llama-server unit
 ```
@@ -229,6 +251,48 @@ harness is exactly the wrong shape for that, so there are two defenses:
 overlap. Two parallel scouts are fine; eight are a stall. This is in the
 lead's prompt. Need real burst parallelism? Point `sidekick` at a cheap
 flash-class API model instead — that is exactly what that knob is for.
+
+## Graft (the repo graph)
+
+[Graft](https://github.com/trailhq/Graft) is the third tier: a repo context
+graph as a folder of linked markdown — a local, regenerable cache that every
+query keeps in sync with the code. It is part of the setup, not an add-on:
+the graph lives in **your project**, never in the harness, and its core
+needs no LLM and no key. Agents use the graft tools first and fall back to
+grep only where a project has no `graft/` index yet.
+
+- **Install once, globally**: `npm install -g @nanonets/graft` (Node 20+).
+  On a new machine, `oc-fusion doctor` nags you until it's there.
+- **Build in the project you work in**: `graft build`. The structural pass —
+  wiring graph plus per-file cards — is $0 and keyless. `--deep` adds the
+  LLM concept map and per-symbol summaries; it needs a provider key, and
+  nothing in this harness runs it automatically.
+- **Query locally**: `graft ask "..."`, `graft grep <pattern>`, `graft map`,
+  `graft callers <symbol>`, `graft skeleton <file>`, `graft check`. All
+  structural, all $0.
+- **MCP**: `opencode.jsonc` registers `graft mcp` as a local stdio server,
+  launched through the same offline wrapper as the CLI (below). OpenCode
+  starts it with the session's project directory as its cwd, so it indexes
+  whatever repo you have open — no path is hardcoded, and the harness
+  directory is never the target. The agents then get `graft_repo_map`,
+  `graft_find_code`, `graft_find_all`, `graft_trace_calls`, `graft_file_api`
+  and `graft_check_freshness`. In a project with no `graft/` index the
+  server starts and advertises no tools; the agents fall back to grep and
+  scout.
+- **CLI fallback**: the same queries run from the shell — `oc-fusion graft
+  map`, `oc-fusion graft ask "..."` — forwarded to the `graft` CLI in your
+  current project, not the harness root.
+- **Privacy**: every graft process Fusion starts — MCP server or CLI
+  forward — runs through a Linux `unshare` wrapper that removes network
+  access for the process **and its children** (Graft's daily npm update
+  check survives `DO_NOT_TRACK` otherwise), sets `DO_NOT_TRACK=1` for its
+  anonymous usage stats, and refuses `--deep` so no provider-backed LLM
+  pass can run through the harness. Missing isolation fails closed with an
+  error, never online. This is network isolation, not a filesystem sandbox:
+  queries may still refresh the project's local `graft/` cache.
+
+Restart opencode after changing the `mcp` block in `opencode.jsonc`, like
+every other config change in this harness.
 
 ## Accounting
 
@@ -305,9 +369,13 @@ prompts/*.md               the five role prompts
 .opencode/plugin/fusion.js routing, the guard, effort injection, compression,
                            discovery, accounting
 bin/oc                     entry point
-bin/oc-fusion              panel CLI + doctor + usage
+bin/oc-fusion              panel CLI + doctor + usage + graft forwarder
 examples/llama-server.service  example local-server unit
 ```
+
+Per project: a `graft/` graph directory (git-ignored, regenerable via
+`graft build`) and a `.fusion/` directory for usage logs and escalation
+briefs.
 
 ## Credit
 

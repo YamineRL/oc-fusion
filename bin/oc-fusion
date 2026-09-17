@@ -6,7 +6,8 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PROFILE="$ROOT/fusion.jsonc"
 UNIT="$HOME/.config/systemd/user/llama-server.service"
 
-BASES="glm glm-flash fable astra sol opus"
+BASES="union-alpha glm glm-flash fable astra sol opus"
+GRAFT_CMDS="build check map ask grep skeleton callers mcp"
 SIDEKICKS="local local-fast local-deep glm deepseek"
 CRITICS="local flash lead"
 SPEEDS="normal fast"
@@ -72,8 +73,11 @@ usage: oc-fusion <command>
   oracle     <$(echo $BASES | tr ' ' '|')>   (only used when escalation=fable)
   guard      <$(echo $GUARDS | tr ' ' '|')>
   compress   <on|off>
-  usage                 aggregate .fusion/usage.jsonl (per-agent tokens + cost)
+  usage                  aggregate .fusion/usage.jsonl (per-agent tokens + cost)
   doctor                 check the config against the llama-server unit
+  graft      <build|check|map|ask|grep|skeleton|callers|mcp> [args...]
+                         local graph in your current project; network-isolated
+                         on Linux (unshare required). See oc-fusion graft help.
 EOF
 }
 
@@ -130,6 +134,39 @@ case "$cmd" in
     [ $# -ge 2 ] || die "usage: oc-fusion compress <on|off>"
     case "$2" in on) v=true;; off) v=false;; *) die "use on or off";; esac
     set_key compress_tool_output "$v" no ;;
+  graft)
+    # Forward to the global graft CLI in the CALLER's project (cwd) — never the
+    # harness root. Explicit only: this path does not install graft, and it
+    # builds or refreshes nothing on its own; a forwarded query may refresh the
+    # project's local graft/ cache the way graft itself does.
+    shift
+    if [ $# -eq 0 ]; then
+      cat <<'EOF'
+usage: oc-fusion graft <build|check|map|ask|grep|skeleton|callers|mcp> [args...]
+
+Use the globally installed graft CLI (npm install -g @nanonets/graft) in
+this project. Linux unshare isolates the process AND its children from the
+network; telemetry is disabled. Missing isolation fails closed, never online.
+This is network isolation, not a filesystem sandbox: queries may refresh the
+local graph. Build explicitly once, then restart OpenCode to discover tools.
+--deep is not supported here. Use plain graft outside Fusion if you explicitly
+want provider-backed enrichment. oc-fusion graft --help shows the CLI manual.
+EOF
+      exit 0
+    fi
+    command -v graft >/dev/null || die "graft CLI not on PATH — npm install -g @nanonets/graft"
+    case "$1" in
+      -h|--help|help) set -- --help ;;
+      *) in_list "$1" $GRAFT_CMDS || die "unknown graft command \"$1\". Known: $GRAFT_CMDS" ;;
+    esac
+    for arg in "$@"; do
+      case "$arg" in --deep|--deep=*) die "--deep is outside Fusion's offline structural workflow" ;; esac
+    done
+    command -v unshare >/dev/null || die "offline Graft requires Linux unshare (util-linux); refusing to run online"
+    unshare --user --map-root-user --net true 2>/dev/null || die "network isolation unavailable; enable unprivileged user namespaces to use offline Graft"
+    export DO_NOT_TRACK=1
+    exec unshare --user --map-root-user --net -- graft "$@"
+    ;;
   doctor)
     [ -f "$UNIT" ] || die "no llama-server unit at $UNIT"
     ctx=$(grep -oP '(?<=-c )\d+' "$UNIT" | head -1)
@@ -164,6 +201,22 @@ case "$cmd" in
     fi
     [ "$mmax" = "1" ] && echo "note      models-max=1: only one local model can be resident at a time."
     [ "$par" = "1" ] && echo "note      parallel=1: concurrent local calls queue rather than overlap."
+    # Graft is part of the setup: the graph lives per-project, the CLI global.
+    if command -v graft >/dev/null; then
+      echo "graft     $(graft --version 2>/dev/null || echo installed)"
+    else
+      echo "graft     MISSING — npm install -g @nanonets/graft (agents fall back to grep until then)"
+    fi
+    if command -v unshare >/dev/null && unshare --user --map-root-user --net true 2>/dev/null; then
+      echo "  ok: offline wrapper available (network isolation for graft processes)."
+    else
+      echo "  WARN: network isolation unavailable; the graft wrapper refuses to run rather than go online."
+    fi
+    if [ -d "$PWD/graft" ]; then
+      echo "  ok: graft/ index present in this project."
+    else
+      echo "  note: no graft/ index in this project — run \`graft build\` here once."
+    fi
     ;;
   usage)
     # Aggregate .fusion/usage.jsonl (see block above for the implementation).
@@ -178,7 +231,7 @@ from collections import defaultdict
 
 path, base = sys.argv[1], sys.argv[2]
 # Lead rates ($/M in, $/M out) -- keep in step with the table in fusion.js.
-LEAD = {"glm": (0.70, 2.20), "glm-flash": (0.015, 0.05),
+LEAD = {"union-alpha": (0, 0), "glm": (0.70, 2.20), "glm-flash": (0.015, 0.05),
         "fable": (10, 50), "astra": (10, 50), "sol": (5, 30), "opus": (5, 25)}
 rin, rout = LEAD.get(base, LEAD["glm"])
 
@@ -215,8 +268,12 @@ print(f"{'TOTAL':<10} {'':>5} {'':>8} {'':>8} {'':>9} ${total_cost:>7.3f}")
 print()
 print(f"lead model rates ({base}): ${rin}/${rout} per M in/out")
 print(f"delegated tokens (non-lead): {fmt(shadow_in)} in / {fmt(shadow_out)} out+reasoning")
-print(f"shadow cost if billed at lead rates: ${shadow:.3f}")
-print("(upper bound on what delegation saved; local agents actually cost $0)")
+if rin == 0 and rout == 0:
+    print("shadow cost at lead rates: $0.000 (free lead: delegation saves context and")
+    print("rate-limit budget here, not money — switch base to a paid lead to price it)")
+else:
+    print(f"shadow cost if billed at lead rates: ${shadow:.3f}")
+    print("(upper bound on what delegation saved; local agents actually cost $0)")
 PY
     ;;
   -h|--help|help) usage ;;

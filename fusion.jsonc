@@ -5,19 +5,23 @@
   // harness come from the sidekick tier, never from economizing here:
   // glm-5.3-class is the floor; fable/astra/opus are the on-par-with-Fusion
   // configs. Flash-class models belong in "sidekick", not here.
+  //   union-alpha  opencode/union-alpha  $0/$0  free Zen stealth lead,
+  //                                   no effort levels: "reasoning" is ignored
   //   glm       zai/glm-5.3          $0.70/$2.20   efforts: low high max
   //   glm-flash zai/glm-5.3-flash    $0.015/$0.05  efforts: low high max
   //   fable     claude-fable-5-1     $10/$50       + medium xhigh
   //   astra     gpt-6-astra          $10/$50       + medium xhigh
   //   sol       gpt-5.6-sol          $5/$30        + none medium xhigh
   //   opus      claude-opus-5        $5/$25        + medium xhigh
-  "base": "glm",
+  "base": "union-alpha",
 
   // Lead reasoning level: low | medium | high | xhigh | max
   // Clamped to what the chosen base actually offers, always to the nearest
   // level at or BELOW the request, so it never silently costs more than you
   // asked for. On glm (low/high/max) that means xhigh -> high and, note,
   // medium -> low; ask for "high" if you want glm's middle setting.
+  // union-alpha ignores this knob: it advertises no levels and manages its
+  // own effort, so the harness sends no variant for it.
   "reasoning": "high",
   // Where the lead goes when it cannot crack something, via the `escalate`
   // tool. Claude Code is a subscription you already pay for, so it costs no
@@ -50,7 +54,7 @@
   // reasoning_effort injected per local agent (chat-template levels; a
   // template throws on one it does not know, so adjust to your model).
   // Delete an entry to fall back to the server's unit-level default.
-  "local_efforts": { "scout": "low", "grunt": "medium", "critic": "high" },
+  "local_efforts": { "scout": "low", "grunt": "medium", "critic": "xhigh" },
 
   // Who reviews diffs before work is called done. Independent of "sidekick":
   // the default local critic is the weakest model in the fleet auditing the

@@ -25,6 +25,10 @@ const API_KEY_FILE = process.env.FUSION_API_KEY_FILE ?? path.join(os.homedir(), 
 const LADDER = ["none", "low", "medium", "high", "xhigh", "max"];
 
 const BASES = {
+  // OpenCode Zen's free stealth lead. It reasons (reasoning: true) but
+  // advertises no levels, so its ladder is empty: the model manages its own
+  // effort and the harness must send no variant for it.
+  "union-alpha": { model: "opencode/union-alpha", efforts: [], free: true },
   glm:       { model: "merge-gateway/zai/glm-5.3",              efforts: ["low", "high", "max"] },
   "glm-flash": { model: "merge-gateway/zai/glm-5.3-flash",      efforts: ["low", "high", "max"] },
   fable:     { model: "merge-gateway/anthropic/claude-fable-5-1", efforts: ["low", "medium", "high", "xhigh", "max"] },
@@ -135,8 +139,11 @@ function readProfile(dir) {
 }
 
 // Clamp a requested effort to what this model actually advertises, preferring
-// the nearest level at or below the request.
+// the nearest level at or below the request. An empty ladder means the model
+// advertises no levels at all: it manages its own effort, so the honest
+// answer is "no variant".
 function clampEffort(want, available) {
+  if (available.length === 0) return null;
   if (available.includes(want)) return want;
   const wi = LADDER.indexOf(want);
   if (wi < 0) return available[available.length - 1];
@@ -149,6 +156,7 @@ function clampEffort(want, available) {
 // One notch down, but never all the way to "none": `speed: fast` is meant to
 // trade depth for latency, not to switch the lead's reasoning off.
 function stepDown(effort, available) {
+  if (effort == null) return null; // no ladder: the model manages its own effort
   const i = available.indexOf(effort);
   if (i <= 0) return effort;
   const next = available[i - 1];
@@ -201,17 +209,21 @@ function readUnit() {
 async function residentModels($) {
   try {
     const txt = await $`ps -eo args=`.text();
-    const found = new Set();
+    const found = new Map();
     for (const line of txt.split("\n")) {
-      if (!line.includes("llama-server")) continue;
-      let m = line.match(/--alias\s+(\S+)/);
-      if (m) { found.add(m[1]); continue; }
-      m = line.match(/(?:--model|-m)\s+(\S+\.gguf)/);
-      if (m) found.add(path.basename(m[1], ".gguf"));
+      if (!/^\s*\S*llama-server\s/.test(line)) continue;
+      const alias = line.match(/--alias\s+(\S+)/)?.[1];
+      const model = line.match(/(?:--model|-m)\s+(\S+\.gguf)/)?.[1];
+      const id = alias ?? (model ? path.basename(model, ".gguf") : null);
+      if (!id) continue;
+      found.set(id, {
+        ctx: Number(line.match(/(?:^|\s)(?:-c|--ctx-size)\s+(\d+)/)?.[1]) || null,
+        parallel: Number(line.match(/(?:^|\s)(?:-np|--parallel)\s+(\d+)/)?.[1]) || null,
+      });
     }
     return found;
   } catch {
-    return new Set();
+    return new Map();
   }
 }
 
@@ -226,6 +238,7 @@ export const server = async ({ directory, $ }) => {
     console.error(`[fusion] unknown base "${profile.base}", falling back to "${DEFAULTS.base}". Known: ${Object.keys(BASES).join(", ")}`);
   }
   const oracleBase = BASES[profile.oracle] ?? BASES.fable;
+  const oracleEffort = clampEffort("max", oracleBase.efforts);
   const fast = profile.speed === "fast";
 
   let leadEffort = clampEffort(profile.reasoning, base.efforts);
@@ -246,16 +259,19 @@ export const server = async ({ directory, $ }) => {
   if (!criticKnown) {
     console.error(`[fusion] unknown critic "${profile.critic}", falling back to "local". Known: ${Object.keys(CRITICS).join(", ")}`);
   }
+  const criticEffort = clampEffort("low", base.efforts);
   const criticPatch =
     criticChoice === "lead"
-      ? { model: leadModel, variant: clampEffort("low", base.efforts) }
+      ? { model: leadModel, ...(criticEffort ? { variant: criticEffort } : {}) }
       : criticChoice; // null (local) or { model, variant }
 
   const resident = await residentModels($);
   // The wire id every local alias sends: pinned via the panel, else whatever
   // the running server has resident. Discovery means the harness cannot ask
   // the server for a model it does not have loaded.
-  const localWireId = profile.local_model ?? [...resident][0] ?? null;
+  const localWireId = profile.local_model ?? [...resident.keys()][0] ?? null;
+  // Router presets put context flags on the child, not the systemd unit.
+  const localRuntime = resident.get(localWireId);
   if (!localWireId) {
     console.error("[fusion] no local model pinned and none resident (is llama-server running?). Local agents will fail until it is up.");
   }
@@ -267,7 +283,7 @@ export const server = async ({ directory, $ }) => {
   const loggedMessages = new Set();
 
   const banner = [
-    `[fusion] lead ${leadModel} (${leadEffort})`,
+    `[fusion] lead ${leadModel}${leadEffort ? ` (${leadEffort})` : ""}`,
     `sidekick ${sidekick}${sidekickIsLocal ? " [free]" : ""}`,
     `critic ${
       criticPatch
@@ -276,7 +292,7 @@ export const server = async ({ directory, $ }) => {
     }`,
     `escalate ${
       profile.escalation === "fable"
-        ? `${oracleBase.model} (max, paid)`
+        ? `${oracleBase.model}${oracleEffort ? ` (${oracleEffort})` : ""}${oracleBase.free ? " [free]" : " (paid)"}`
         : profile.escalation === "run"
           ? "claude -p (subscription)"
           : "Claude Code handoff brief (no spend)"
@@ -285,13 +301,17 @@ export const server = async ({ directory, $ }) => {
   ].join(" | ");
   console.error(banner);
   if (fast && !FAST_TWIN[base.model]) {
-    console.error(`[fusion] note: the gateway publishes no -fast twin for ${base.model}; fast = one notch less reasoning + tighter step budget.`);
+    console.error(
+      leadEffort
+        ? `[fusion] note: the gateway publishes no -fast twin for ${base.model}; fast = one notch less reasoning + tighter step budget.`
+        : `[fusion] note: ${base.model} advertises no reasoning levels, so fast = just the tighter step budget for it.`,
+    );
   }
   if (unit.ctx) {
     console.error(`[fusion] llama-server unit: ctx ${unit.ctx}, parallel ${unit.parallel}, models-max ${unit.modelsMax}, idle-sleep ${unit.idle}s`);
   }
   if (sidekickIsLocal && resident.size && !resident.has(localWireId)) {
-    console.error(`[fusion] WARNING: sidekick wants "${localWireId}" but resident is "${[...resident].join(", ")}". First sidekick call will evict it.`);
+    console.error(`[fusion] WARNING: sidekick wants "${localWireId}" but resident is "${[...resident.keys()].join(", ")}". First sidekick call will evict it.`);
   }
 
   return {
@@ -346,13 +366,19 @@ export const server = async ({ directory, $ }) => {
           fs.writeFileSync(file, brief);
           const rel = path.relative(ctx.directory, file);
 
+          // Interactive by design: no -p or --output-format (the human wants
+          // a conversation, not print-and-exit) and no --allowed-tools (they
+          // can approve tools live, so restricting them would only remove
+          // capability). --model is the one flag worth carrying over from
+          // runClaudeCode so a pinned claude_model applies to both routes.
+          const modelFlag = profile.claude_model ? ` --model ${String(profile.claude_model)}` : "";
           return {
             title: "Escalate to Claude Code",
             output:
               `I cannot crack this, and escalating to a frontier model would spend gateway\n` +
               `balance. The handoff brief is saved to ${rel}.\n\n` +
               `To hand it to Claude Code (subscription, no gateway spend):\n\n` +
-              `    claude "$(cat ${rel})"\n\n` +
+              `    claude${modelFlag} "$(cat ${rel})"\n\n` +
               `or open \`claude\` in this directory and paste the brief.\n\n` +
               `--- brief ---\n${brief}\n\n` +
               `STOP HERE. Report this to the user and do not keep retrying the same\n` +
@@ -365,16 +391,29 @@ export const server = async ({ directory, $ }) => {
 
     // Apply the control panel to the agent set at load.
     config: async (cfg) => {
+      // Resolve our bundled launcher, not a machine-specific path or cwd.
+      // Leave explicit project MCP overrides and enabled:false untouched.
+      const graft = cfg.mcp?.graft;
+      if (graft?.type === "local" && JSON.stringify(graft.command) === JSON.stringify(["oc-fusion", "graft", "mcp"])) {
+        graft.command = ["bash", path.join(HARNESS, "bin", "oc-fusion"), "graft", "mcp"];
+      }
       cfg.agent ??= {};
       const set = (name, patch) => { cfg.agent[name] = { ...(cfg.agent[name] ?? {}), ...patch }; };
 
-      set("fusion", { model: leadModel, variant: leadEffort, steps: fast ? 200 : 400 });
+      set("fusion", {
+        model: leadModel,
+        // A model with no advertised levels gets no variant: it manages its
+        // own effort, and an invented one would either be dropped or
+        // rejected.
+        ...(leadEffort ? { variant: leadEffort } : {}),
+        steps: fast ? 200 : 400,
+      });
 
       // The paid oracle exists only when explicitly chosen. Otherwise it is
       // disabled and the `escalate` tool hands off to Claude Code instead, so
       // a stuck lead cannot quietly spend gateway balance on frontier tokens.
       if (profile.escalation === "fable") {
-        set("oracle", { model: oracleBase.model, variant: clampEffort("max", oracleBase.efforts) });
+        set("oracle", { model: oracleBase.model, ...(oracleEffort ? { variant: oracleEffort } : {}) });
       } else {
         set("oracle", { disable: true });
       }
@@ -395,13 +434,21 @@ export const server = async ({ directory, $ }) => {
       else if (!sidekickIsLocal) set("critic", { model: sidekick });
       // else: critic keeps llamacpp/fusion-sidekick-deep from the agent table
 
-      // Keep the declared local context in step with the unit, so opencode
-      // never packs a prompt the server has to reject. With --parallel N the
-      // window is split N ways, so the ceiling is per-slot.
-      if (unit.ctx && cfg.provider?.llamacpp?.models) {
-        const perSlot = Math.max(8192, Math.floor((unit.ctx - 1024) / (unit.parallel ?? 1)));
-        for (const m of Object.values(cfg.provider.llamacpp.models)) {
-          if (m.limit?.context && m.limit.context > perSlot) m.limit.context = perSlot;
+      // Prefer the resident child's flags: router presets can override the
+      // unit. Follow increases as well as decreases, reserving 1024 tokens
+      // per slot for template overhead. Keep the configured output budgets.
+      const context = localRuntime?.ctx ?? unit.ctx;
+      const parallel = localRuntime?.parallel ?? unit.parallel ?? 1;
+      if (context && cfg.provider?.llamacpp?.models) {
+        const perSlot = Math.floor(context / parallel) - 1024;
+        if (perSlot > 0) {
+          for (const m of Object.values(cfg.provider.llamacpp.models)) {
+            if (m.limit) {
+              m.limit.context = perSlot;
+              if (m.limit.output) m.limit.output = Math.min(m.limit.output, Math.floor(perSlot / 2));
+            }
+          }
+          console.error(`[fusion] local context: ${perSlot} tokens (${context} total / ${parallel} slots, 1024 reserved per slot)`);
         }
       }
     },
@@ -472,7 +519,7 @@ export const server = async ({ directory, $ }) => {
       // unloads it and kills whatever it was generating.
       if (profile.guard !== "off" && wire && resident.size && !resident.has(wire)) {
         const msg =
-          `[fusion] "${wire}" is not resident (resident: ${[...resident].join(", ") || "none"}). ` +
+          `[fusion] "${wire}" is not resident (resident: ${[...resident.keys()].join(", ") || "none"}). ` +
           `llama-server runs --models-max ${unit.modelsMax ?? 1}, so this request would unload it mid-flight.`;
         if (profile.guard === "strict") {
           throw new Error(`${msg} Refusing: set "guard": "warn" in fusion.jsonc to allow.`);

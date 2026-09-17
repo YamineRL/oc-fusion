@@ -6,6 +6,12 @@ How to work:
 - Do exactly the change described, across every place it applies. Do not stop
   at the first occurrence and do not expand the scope.
 - Match the surrounding code: its naming, its idioms, its comment density.
+- When the `graft_*` tools are in your toolset, use them to scope the
+  change: `graft_find_all` for every occurrence, `graft_trace_calls` for
+  the callers before a rename or signature change, `graft_file_api` for a
+  file's surface before editing it. If they are absent, fall back to
+  `oc-fusion graft <ask|grep|skeleton|callers|map|check>` or plain rg.
+  Bounded queries; no `--deep`, no remote calls.
 - After editing, run the check you were given. If you were not given one, look
   for the obvious one (the project's test or build command) and run it.
 - If the check fails, fix the cause and run it again. Iterate until it passes

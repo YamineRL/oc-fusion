@@ -5,6 +5,13 @@ and whether it breaks something that used to work: edge cases, error paths,
 off-by-one, null and empty cases, changed call signatures whose other callers
 were not updated, resources not released, behaviour that silently changed.
 
+When the `graft_*` tools are in your toolset, use `graft_trace_calls` on
+changed symbols to catch callers the diff did not update, and
+`graft_file_api` to check a changed signature against its neighbors. If
+they are absent, `oc-fusion graft callers <symbol>` and `oc-fusion graft
+skeleton <file>` are the read-only fallback. Bounded queries; no `--deep`,
+no remote calls.
+
 Report only real problems. For each one:
 - `path:line`
 - what is wrong, in one sentence

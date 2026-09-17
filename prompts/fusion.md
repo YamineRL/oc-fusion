@@ -61,8 +61,8 @@ Do yourself:
 
 ## How to delegate well
 
-The sidekick is capable but literal, and it has a 44k context window and no
-memory of this conversation. A delegation that fails is almost always a
+The sidekick is capable but literal. Its context window follows the running
+local model's per-slot capacity, and it has no memory of this conversation. A delegation that fails is almost always a
 delegation that was underspecified. So:
 
 - State the goal, the exact files or starting points, and the shape of the
@@ -76,6 +76,19 @@ delegation that was underspecified. So:
   overlap: two scouts are fine, eight are a stall.
 - Verify what comes back. If a `grunt` edit touches something subtle, read the
   diff yourself. Trust it on mechanics, not on taste.
+
+## Graft tools (when the project has a graph)
+
+If `graft_repo_map`, `graft_find_code`, `graft_find_all`,
+`graft_trace_calls`, `graft_file_api` are in your toolset, they are the
+cheapest way to orient, locate, and size a change: structural, local, exact
+file:line, and they cost no file reads. Use `graft_trace_calls` before
+multi-file edits to get the blast radius, `graft_find_all` when you need
+every occurrence, and `graft_file_api` before reading a whole file. Keep
+each query bounded — one question, one symbol. If the tools are absent
+(the project has no `graft/` index), fall back to scout and grep; do not
+install or build anything yourself, and never pass `--deep` or any LLM or
+remote flag to a graft command.
 
 ## Efficiency rules
 

@@ -10,6 +10,19 @@ How to work:
 - Read only as much of a file as the question needs.
 - Follow the question, not your curiosity. Do not audit unrelated code.
 
+When graft is available:
+- If the `graft_*` tools are in your toolset, prefer them over raw grep for
+  orientation, locating, and call tracing: structural, exact file:line,
+  cheap.
+- If they are absent, the read-query CLI forms are yours: `oc-fusion graft
+  ask <query>`, `oc-fusion graft grep <pattern>`, `oc-fusion graft skeleton
+  <file>`, `oc-fusion graft callers <symbol>`, `oc-fusion graft map`,
+  `oc-fusion graft check`.
+- A graft query may refresh the project's local `graft/` cache — a
+  structural local rebuild, which is expected and fine.
+- Never build, never `--deep`, never any other graft command. Read-only
+  still means read-only.
+
 How to report. This is the part that matters:
 - Lead with the direct answer in one or two sentences.
 - Then the evidence, as a short list of `path:line` with one line each.

@@ -30,12 +30,17 @@ local model. You get the best results by working *with* that split:
 
 ```
 oc-fusion status                    # what's live
-oc-fusion base glm|fable|...        # lead; glm-5.3-class is the floor, fable/astra/opus are on-par
+oc-fusion base union-alpha|glm|fable|...   # lead; union-alpha is the free Zen stealth model
 oc-fusion critic local|flash|lead   # who reviews diffs — see README
 oc-fusion speed fast                # faster session: -1 reasoning notch on the lead
 oc-fusion escalation advise|run|fable
 ```
 
+- **`base union-alpha`** runs the week's free lead: OpenCode Zen's stealth
+  model for agentic coding, $0 in / $0 out. It advertises no reasoning
+  levels, so `oc-fusion reasoning ...` is a no-op for it (the model manages
+  its own effort). No public benchmarks — if it disappoints on a task, flip
+  back with `oc-fusion base glm` mid-week; the panel is just a config edit.
 - **`critic lead`** is worth setting when the work is subtle: the lead
   re-reads its own diff at low effort, sub-cent per review.
 - **`escalation advise`** (default) is usually right. When the lead gets
@@ -45,6 +50,26 @@ oc-fusion escalation advise|run|fable
   `fable` spends gateway balance.
 - A `fusion.jsonc` in the project you're working in overrides the panel —
   that's per-repo pinning, but it also means a stray file silently wins.
+
+## Graft (repo graph)
+
+[Graft](https://github.com/trailhq/Graft) adds a local
+context graph over **the project you have open** — a regenerable cache of
+linked markdown, no LLM, no key. It is part of the setup: the agents get
+graft_* tools for orientation, locating, and blast radius, and only fall
+back to grep and scout in a project that has no graph yet.
+
+```
+npm install -g @nanonets/graft
+cd <yourproject> && graft build     # structural pass, $0
+```
+
+Then restart opencode (`mcp.graft` in `opencode.jsonc` is read at startup).
+From the shell, `oc-fusion graft <build|check|map|ask|grep|skeleton|callers>
+[args...]` runs graft in the project you're standing in — through an
+offline wrapper: no network for graft or its children, `DO_NOT_TRACK=1`,
+and `--deep` refused (use plain `graft` outside the harness if you
+explicitly want the provider-backed LLM pass; nothing runs it for you).
 
 ## Watching the money
 

@@ -36,6 +36,29 @@
     "max_bytes": 40000
   },
 
+  // Local repo context graph: https://github.com/trailhq/Graft
+  // `graft mcp` is a stdio server that indexes the graph of the project you have
+  // open: opencode starts it with the session's project directory as its cwd, and
+  // graft resolves the nearest graft/ index from there — so whatever repo you work
+  // in is what gets indexed, and no path is pinned in this file. Needs the global
+  // graft CLI (`npm install -g @nanonets/graft`) and a `graft/` index in the
+  // project (`graft build`, structural, no LLM, no key). Without an index the
+  // server starts and advertises no tools; the agents fall back to grep/scout.
+  // Restart opencode after any change to this block.
+  "mcp": {
+    "graft": {
+      "type": "local",
+      "command": ["oc-fusion", "graft", "mcp"],
+      "enabled": true,
+      "environment": {
+        // The launcher also blocks network access for child processes using
+        // Linux user/network namespaces. DO_NOT_TRACK alone does NOT stop
+        // Graft's npm update check. No remote enrichment through this wrapper.
+        "DO_NOT_TRACK": "1"
+      }
+    }
+  },
+
   "provider": {
     "llamacpp": {
       "npm": "@ai-sdk/openai-compatible",
@@ -105,7 +128,23 @@
       "permission": {
         "edit": "deny",
         "write": "deny",
-        "bash": { "*": "deny", "git log*": "allow", "git diff*": "allow", "git show*": "allow", "rg *": "allow", "grep *": "allow", "fd *": "allow", "ls *": "allow", "cat *": "allow", "sed -n *": "allow", "wc *": "allow", "head *": "allow", "tail *": "allow" }
+        "bash": {
+          "*": "deny",
+          "git log*": "allow", "git diff*": "allow", "git show*": "allow",
+          "rg *": "allow", "grep *": "allow", "fd *": "allow",
+          "ls *": "allow", "cat *": "allow", "sed -n *": "allow",
+          "wc *": "allow", "head *": "allow", "tail *": "allow",
+          // Graft read-query forms only (via the harness forwarder): locate,
+          // trace, orient. Never build/init/uninstall. Queries may refresh the
+          // local graft/ cache — a structural local rebuild, not a write to the
+          // project's source.
+          "oc-fusion graft ask*": "allow",
+          "oc-fusion graft grep*": "allow",
+          "oc-fusion graft skeleton*": "allow",
+          "oc-fusion graft callers*": "allow",
+          "oc-fusion graft map*": "allow",
+          "oc-fusion graft check*": "allow"
+        }
       }
     },
     "grunt": {
