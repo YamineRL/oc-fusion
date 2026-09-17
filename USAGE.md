@@ -71,6 +71,17 @@ offline wrapper: no network for graft or its children, `DO_NOT_TRACK=1`,
 and `--deep` refused (use plain `graft` outside the harness if you
 explicitly want the provider-backed LLM pass; nothing runs it for you).
 
+## rtk (output compression, always on)
+
+[rtk](https://github.com/rtk-ai/rtk) rewrites Bash commands through the
+vendored plugin before they run: `git status` becomes a stat line, test
+runs collapse to failures, listings become trees. It applies to every
+agent — the sidekick reading test output benefits as much as the lead.
+`brew install rtk` once; `oc-fusion doctor` reports it. If rtk is
+missing, commands run unchanged (the plugin disables itself). The full
+output of a failed command is recoverable with `rtk recall <id>` — the
+compacted line carries the id. `rtk gain` shows what it saved, locally.
+
 ## Watching the money
 
 ```

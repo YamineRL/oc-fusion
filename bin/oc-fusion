@@ -217,6 +217,12 @@ EOF
     else
       echo "  note: no graft/ index in this project — run \`graft build\` here once."
     fi
+    # rtk compresses command output before any agent reads it.
+    if command -v rtk >/dev/null; then
+      echo "rtk       $(rtk --version 2>/dev/null || echo installed)"
+    else
+      echo "rtk       MISSING — brew install rtk (or cargo install --git https://github.com/rtk-ai/rtk)"
+    fi
     ;;
   usage)
     # Aggregate .fusion/usage.jsonl (see block above for the implementation).

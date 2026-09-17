@@ -9,8 +9,10 @@ or a cheap flash-class API model — does the reading, searching, mechanical
 editing, and test-running. What the lead cannot crack goes to a Claude Code
 subscription you already pay for, instead of a per-token frontier fallback.
 And under both tiers, a local [Graft](https://github.com/trailhq/Graft) graph
-maps every project — symbols, call edges, exact file:line — so no agent
-re-explores the repo from zero on each task.
+maps every project — symbols, call edges, exact file:line — while
+[rtk](https://github.com/rtk-ai/rtk) compresses command output before any
+agent reads it. No agent re-explores the repo from zero, and no agent reads
+two hundred lines to learn a test failed.
 
 The savings live in the sidekick, never in the lead. That is the whole
 design: strongest affordable brain, cheapest possible hands.
@@ -35,6 +37,7 @@ oc-fusion is that shape with a different cost structure:
 | Lead     | Claude Fable 5.1   | same class (Fable / Opus / Astra) | GLM-5.3 (the floor) | $0.70/$2.20 … $10/$50 |
 | Sidekick | SWE-2 (medium)     | your own GGUF, or a flash-class API model | same | **$0** or ~$0.03/$0.07 |
 | Repo map | (closed)           | Graft, local per-repo graph      | same              | **$0**              |
+| Output   | (closed)           | rtk, compresses command output   | same              | **$0**              |
 | Escalation | (none)           | Claude Code (subscription)      | same              | $0 gateway          |
 
 Two configurations, one harness:
@@ -93,6 +96,7 @@ same model, its default effort.
 git clone https://github.com/YamineRL/oc-fusion.git
 cd oc-fusion && npm --prefix .opencode install
 npm install -g @nanonets/graft
+brew install rtk
 ```
 
 Then follow "Running it".
@@ -112,6 +116,9 @@ Then:
 1. Run `npm --prefix ~/oc-fusion/.opencode install` and confirm it succeeds.
 2. Install the repo-graph layer: `npm install -g @nanonets/graft` (Node 20+).
    It is part of the harness, not an extra.
+3. Install the output layer: `brew install rtk` (or
+   `cargo install --git https://github.com/rtk-ai/rtk`, or a prebuilt binary
+   from its releases). Also part of the harness, not an extra.
 2. Find my llama-server setup:
    - Look for a systemd user unit named llama-server.service under
      ~/.config/systemd/user/ (also check `systemctl --user list-units |
@@ -140,7 +147,7 @@ Then:
    <fish|bash|zsh>: use fish_add_path for fish, or append the export to the
    right rc file for bash/zsh.
 6. Verify: run `oc-fusion doctor` and show me the output. It should report
-   the port, the context ceiling, the resident model, and a graft line
+   the port, the context ceiling, the resident model, and graft + rtk lines
    without warnings.
 7. Do not start a session yet. Report what you did, what you guessed, and
    what I should change (especially the lead model in fusion.jsonc "base"
@@ -294,6 +301,40 @@ grep only where a project has no `graft/` index yet.
 Restart opencode after changing the `mcp` block in `opencode.jsonc`, like
 every other config change in this harness.
 
+## rtk (the output tier)
+
+[rtk](https://github.com/rtk-ai/rtk) compresses command output before any
+agent reads it — `git status` to a stat line, test runs to failures only,
+listings to tree summaries — a single Rust binary, <10ms overhead. It is
+part of the setup, and it covers **every** agent in the harness: lead,
+sidekick, subagents, because it rewrites at the Bash tool layer, not per
+agent.
+
+- **Install**: `brew install rtk` (or
+  `cargo install --git https://github.com/rtk-ai/rtk`, or a prebuilt
+  release binary). `oc-fusion doctor` reports it and nags until present.
+- **How it runs**: the vendored plugin
+  `.opencode/plugin/rtk.ts` (from rtk's own `rtk init -g --opencode`)
+  rewrites each Bash command via `rtk rewrite` before execution. No rtk in
+  PATH → the plugin disables itself and commands run unchanged; a failed
+  rewrite passes through. Nothing is written into your global config.
+- **What it saves**: the numbers rtk reports are reductions in **bash
+  output**, not in your bill — bash output is one contributor among
+  prompt, history, and output tokens. Percentages are reliable, absolute
+  token counts are estimated (bytes/4).
+- **Division of labour**: rtk compresses at the source, before output
+  reaches a model. The harness's `compress_tool_output` knob still exists
+  for large-but-intact output rtk passes through (it runs after rtk, and
+  only in paid sessions). Truncated-to-file output still goes to scout
+  with the path — that route is lossless and free. `rtk recall <id>`
+  recovers the full output of a failed command rtk compacted.
+- **Privacy**: this rtk build ships no telemetry endpoint (verify with
+  `rtk telemetry status`); its usage stats are local, and `rtk gain`
+  reads them from disk.
+
+Restart opencode after changing the plugin list, like every other config
+change in this harness.
+
 ## Accounting
 
 Every completed assistant message is logged to `.fusion/usage.jsonl` in the
@@ -368,6 +409,7 @@ opencode.jsonc             providers, local aliases, agent definitions
 prompts/*.md               the five role prompts
 .opencode/plugin/fusion.js routing, the guard, effort injection, compression,
                            discovery, accounting
+.opencode/plugin/rtk.ts    vendored rtk output-compression plugin (Bash rewrite)
 bin/oc                     entry point
 bin/oc-fusion              panel CLI + doctor + usage + graft forwarder
 examples/llama-server.service  example local-server unit

@@ -12,7 +12,7 @@
   // shared card free for work you actually asked for.
   "small_model": "merge-gateway/zai/glm-5.3-flash",
 
-  "plugin": ["./.opencode/plugin/fusion.js"],
+  "plugin": ["./.opencode/plugin/fusion.js", "./.opencode/plugin/rtk.ts"],
 
   // Fusion's efficiency comes from fewer, fatter round trips.
   "experimental": {
