@@ -11,4 +11,8 @@
 set -euo pipefail
 HARNESS="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export OPENCODE_CONFIG="$HARNESS/opencode.jsonc"
+# Belt and braces: the harness bin on PATH, so the mcp.graft command
+# ["oc-fusion", "graft", "mcp"] resolves even if the plugin's rewrite to an
+# absolute path never runs (plugin disabled, plugin error, hand-edited config).
+export PATH="$HARNESS/bin:$PATH"
 exec opencode "$@"
