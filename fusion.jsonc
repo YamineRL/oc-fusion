@@ -13,7 +13,7 @@
   //   astra     gpt-6-astra          $10/$50       + medium xhigh
   //   sol       gpt-5.6-sol          $5/$30        + none medium xhigh
   //   opus      claude-opus-5        $5/$25        + medium xhigh
-  "base": "union-alpha",
+  "base": "glm",
 
   // Lead reasoning level: low | medium | high | xhigh | max
   // Clamped to what the chosen base actually offers, always to the nearest
@@ -88,5 +88,34 @@
   // tool_output.max_bytes (40000 in opencode.jsonc); a threshold at or above
   // max_bytes turns compression off in practice.
   "compress_tool_output": true,
-  "compress_threshold": 25000
+  "compress_threshold": 25000,
+
+  // Evidence routing: the runtime measures stalls and scope and lets those
+  // numbers pick the tier, instead of trusting the lead's judgment. Counters
+  // live in plugin memory and .fusion/control.jsonl, so compaction cannot
+  // prune them; the compaction hook re-injects the current state.
+  //   observe   log + annotate tool output, never block (calibration)
+  //   enforce   block the call with an error the agent cannot ignore
+  "routing": "observe",
+
+  // Same file edited this many times by one sidekick agent without a green
+  // verification command -> the file moves to the lead tier.
+  "stall_edits": 3,
+
+  // Same command (normalized, pre-rtk) failing this many times in a row ->
+  // identical retries blocked for every agent, lead included.
+  "stall_commands": 3,
+
+  // Blast-radius measurement via graft. Up front: skeleton + callers on a
+  // sidekick's first edit of each file. After edits: `graft blast` on the
+  // working diff (every 3rd sidekick edit). No graft/ index -> scope is
+  // "unknown" and nothing here blocks on it.
+  "scope_check": true,
+
+  // Dependent-file budget for sidekick edits. Beyond it, edits are lead work.
+  "grunt_max_blast": 8,
+
+  // Repo-relative prefixes sidekick seats may never edit regardless of
+  // measurements, e.g. ["db/migrations/", "deploy/"]. Owner-grade surfaces.
+  "protected_paths": []
 }

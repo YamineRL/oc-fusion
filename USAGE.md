@@ -34,6 +34,7 @@ oc-fusion base union-alpha|glm|fable|...   # lead; union-alpha is the free Zen s
 oc-fusion critic local|flash|lead   # who reviews diffs — see README
 oc-fusion speed fast                # faster session: -1 reasoning notch on the lead
 oc-fusion escalation advise|run|fable
+oc-fusion routing observe|enforce   # measured stalls/scope: annotate vs block
 ```
 
 - **`base union-alpha`** runs the week's free lead: OpenCode Zen's stealth
@@ -50,6 +51,14 @@ oc-fusion escalation advise|run|fable
   `fable` spends gateway balance.
 - A `fusion.jsonc` in the project you're working in overrides the panel —
   that's per-repo pinning, but it also means a stray file silently wins.
+- **`routing enforce`** turns the measured gates into hard blocks: identical
+  commands that already failed `stall_commands` times are refused, a file a
+  sidekick has edited `stall_edits` times without a green check moves to the
+  lead, and graft-measured blast radius over `grunt_max_blast` gates sidekick
+  edits. `observe` (default) only logs and annotates. Every decision lands in
+  `.fusion/control.jsonl`, and the counters survive compaction. Seats hand
+  work in through `oc-fusion work submit <brief.md>`; results land in
+  `.fusion/outbox/`.
 
 ## Graft (repo graph)
 

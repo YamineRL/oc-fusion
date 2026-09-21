@@ -7,13 +7,14 @@ PROFILE="$ROOT/fusion.jsonc"
 UNIT="$HOME/.config/systemd/user/llama-server.service"
 
 BASES="union-alpha glm glm-flash fable astra sol opus"
-GRAFT_CMDS="build check map ask grep skeleton callers mcp"
+GRAFT_CMDS="build check map ask grep skeleton callers blast mcp"
 SIDEKICKS="local local-fast local-deep glm deepseek"
 CRITICS="local flash lead"
 SPEEDS="normal fast"
 EFFORTS="low medium high xhigh max"
 GUARDS="strict warn off"
 ESCALATIONS="advise run fable"
+ROUTING="observe enforce"
 
 die() { echo "oc-fusion: $*" >&2; exit 1; }
 
@@ -75,9 +76,14 @@ usage: oc-fusion <command>
   compress   <on|off>
   usage                  aggregate .fusion/usage.jsonl (per-agent tokens + cost)
   doctor                 check the config against the llama-server unit
-  graft      <build|check|map|ask|grep|skeleton|callers|mcp> [args...]
+  graft      <build|check|map|ask|grep|skeleton|callers|blast|mcp> [args...]
                          local graph in your current project; network-isolated
                          on Linux (unshare required). See oc-fusion graft help.
+  routing    <observe|enforce>
+                         evidence routing: observe logs stalls/scope only,
+                         enforce blocks repeated failures and out-of-scope edits
+  work       <submit|list|results> [file|id]
+                         seat <-> harness work orders (.fusion/inbox|outbox)
 EOF
 }
 
@@ -94,7 +100,7 @@ case "$cmd" in
       fable)  echo "escalate  fable    -> paid oracle subagent: $(get_key oracle) at max" ;;
       *)      echo "escalate  $esc   (unknown)" ;;
     esac
-    echo "guard     $(get_key guard)   compress $(get_key compress_tool_output)"
+    echo "guard     $(get_key guard)   compress $(get_key compress_tool_output)   routing $(get_key routing)"
     echo
     local_res=$(resident || true)
     echo "resident  ${local_res:-<nothing loaded>}"
@@ -130,6 +136,95 @@ case "$cmd" in
     [ $# -ge 2 ] || die "usage: oc-fusion guard <strict|warn|off>"
     in_list "$2" $GUARDS || die "unknown guard \"$2\". Known: $GUARDS"
     set_key guard "$2" yes ;;
+  routing)
+    [ $# -ge 2 ] || die "usage: oc-fusion routing <observe|enforce>"
+    in_list "$2" $ROUTING || die "unknown routing \"$2\". Known: $ROUTING"
+    set_key routing "$2" yes ;;
+  work)
+    # Seat <-> harness work orders. Seats write a markdown brief with
+    # frontmatter (id, seat) and "## Objective" / "## Acceptance" sections;
+    # submit validates and files it in .fusion/inbox/. The lead claims it via
+    # the work_order tool and reports to .fusion/outbox/.
+    shift
+    sub=${1:-list}
+    case "$sub" in
+      submit)
+        [ $# -ge 2 ] || die "usage: oc-fusion work submit <file.md>"
+        [ -f "$2" ] || die "no such file: $2"
+        python3 - "$2" "$PWD/.fusion/inbox" <<'PY'
+import re, shutil, sys, os
+src, inbox = sys.argv[1], sys.argv[2]
+text = open(src).read()
+m = re.match(r"^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$", text)
+errors = []
+meta = {}
+if not m:
+    errors.append("missing frontmatter block (--- ... ---)")
+else:
+    for line in m.group(1).split("\n"):
+        kv = re.match(r"^([A-Za-z_][\w-]*)\s*:\s*(.*)$", line)
+        if kv:
+            meta[kv.group(1)] = kv.group(2).strip().strip('"').strip("'")
+    body = m.group(2)
+    if not re.match(r"^[\w][\w.-]*$", meta.get("id", "")):
+        errors.append('frontmatter needs "id: <slug>"')
+    if not meta.get("seat"):
+        errors.append('frontmatter needs "seat: <originating seat>"')
+    if not re.search(r"^#{1,3}\s+.*objective", body, re.I | re.M):
+        errors.append('body needs an "## Objective" section')
+    if not re.search(r"^#{1,3}\s+.*acceptance", body, re.I | re.M):
+        errors.append('body needs an "## Acceptance" section')
+if errors:
+    for e in errors: print(f"invalid: {e}", file=sys.stderr)
+    sys.exit(1)
+os.makedirs(inbox, exist_ok=True)
+dest = os.path.join(inbox, meta["id"] + ".md")
+shutil.copyfile(src, dest)
+print(f"filed {meta['id']} (from {meta['seat']}) -> {dest}")
+print("the lead picks it up with the work_order tool in an oc session")
+PY
+        ;;
+      list)
+        python3 - "$PWD/.fusion" <<'PY'
+import json, os, re, sys
+base = sys.argv[1]
+inbox = os.path.join(base, "inbox")
+state = {}
+try:
+    state = json.load(open(os.path.join(base, "work-orders.json"))).get("orders", {})
+except Exception:
+    pass
+try:
+    files = sorted(f for f in os.listdir(inbox) if f.endswith(".md"))
+except FileNotFoundError:
+    print("no inbox yet - seats submit with: oc-fusion work submit <file.md>")
+    sys.exit(0)
+if not files:
+    print("inbox is empty")
+for f in files:
+    text = open(os.path.join(inbox, f)).read()
+    m = re.match(r"^---\r?\n([\s\S]*?)\r?\n---", text)
+    meta = dict(re.findall(r"^([A-Za-z_][\w-]*)\s*:\s*(.*)$", m.group(1), re.M)) if m else {}
+    oid = meta.get("id", f[:-3]).strip().strip('"').strip("'")
+    st = state.get(oid, {}).get("status", "pending")
+    seat = meta.get("seat", "?").strip().strip('"').strip("'")
+    print(f"{oid:<28} {st:<16} from {seat}")
+PY
+        ;;
+      results)
+        out="$PWD/.fusion/outbox"
+        if [ ! -d "$out" ] || [ -z "$(ls -A "$out" 2>/dev/null)" ]; then
+          echo "no results yet"; exit 0
+        fi
+        for f in "$out"/*.md; do
+          echo "=== $(basename "$f") ==="
+          head -12 "$f"
+          echo
+        done
+        ;;
+      *) die "usage: oc-fusion work <submit|list|results>" ;;
+    esac
+    ;;
   compress)
     [ $# -ge 2 ] || die "usage: oc-fusion compress <on|off>"
     case "$2" in on) v=true;; off) v=false;; *) die "use on or off";; esac
@@ -142,7 +237,7 @@ case "$cmd" in
     shift
     if [ $# -eq 0 ]; then
       cat <<'EOF'
-usage: oc-fusion graft <build|check|map|ask|grep|skeleton|callers|mcp> [args...]
+usage: oc-fusion graft <build|check|map|ask|grep|skeleton|callers|blast|mcp> [args...]
 
 Use the globally installed graft CLI (npm install -g @nanonets/graft) in
 this project. Linux unshare isolates the process AND its children from the

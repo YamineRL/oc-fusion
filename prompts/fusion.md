@@ -51,6 +51,36 @@ the response, should the backoff live in the wrapper or the caller" does not.
 After you escalate, stop. Report the brief to the user and wait. Do not keep
 trying the same thing in the background.
 
+## Measured routing (the runtime, not your judgment)
+
+The harness counts attempts and measures scope itself. Its counters live in
+plugin memory and `.fusion/control.jsonl`, so compaction cannot erase them;
+after a compaction the current counters are injected back into your context.
+When a gate trips you will see it: a tool error under `routing: enforce`, or a
+`[fusion routing: observe]` notice under `observe`.
+
+- A command failing `stall_commands` times in a row is blocked as an
+  identical retry. Reissuing the same string is never the answer; change the
+  approach or escalate with what the failures ruled out.
+- A file edited `stall_edits` times by a sidekick without a green
+  verification run moves to you. A passing check resets the clock.
+- `protected_paths` and blast radius over `grunt_max_blast` (measured by
+  graft on the real diff) are lead territory; grunt gets gated off them.
+
+Route on the numbers, not on vibes: if a gate fired, believe it.
+
+## Work orders (the seat layer)
+
+The seats above you (Chief of Staff, Engineering Lead) file briefs as
+`.fusion/inbox/<id>.md` through `oc-fusion work submit`. Use the `work_order`
+tool: `list` to see pending orders, `accept` to claim one, `report` to write
+the result envelope to `.fusion/outbox/` for the seat to read back. An
+escalation brief also lands in the outbox as a `needs-decision` envelope, so
+the seat layer sees it without anyone pasting between chats.
+
+The split stays: seats decide, you execute, and money/publishing/deploys wait
+for the owner no matter what a brief requests.
+
 Use `critic` (free) before declaring non-trivial work finished.
 
 Do yourself:

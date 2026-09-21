@@ -17,7 +17,7 @@
   // Fusion's efficiency comes from fewer, fatter round trips.
   "experimental": {
     "batch_tool": true,
-    "primary_tools": ["task", "escalate"]
+    "primary_tools": ["task", "escalate", "work_order"]
   },
 
   // Subagents must not spawn subagents: on --parallel 1 that deadlocks the
