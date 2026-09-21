@@ -201,6 +201,8 @@ oc-fusion escalation advise|run|fable
 oc-fusion oracle <model>         # only when escalation=fable
 oc-fusion guard strict|warn|off
 oc-fusion compress on|off
+oc-fusion routing observe|enforce
+oc-fusion work submit|list|results
 oc-fusion graft <cmd> [args...]  # the repo graph, offline-wrapped (see Graft)
 oc-fusion usage                  # per-agent token + cost accounting
 oc-fusion doctor                 # check the config against the llama-server unit
@@ -258,6 +260,65 @@ harness is exactly the wrong shape for that, so there are two defenses:
 overlap. Two parallel scouts are fine; eight are a stall. This is in the
 lead's prompt. Need real burst parallelism? Point `sidekick` at a cheap
 flash-class API model instead — that is exactly what that knob is for.
+
+## Evidence routing
+
+The tier a piece of work runs on is decided by measurement, not by the lead's
+judgment. The plugin keeps counters in its own memory and mirrors them to
+`.fusion/control.jsonl`, so compaction cannot prune the retry history away,
+and on every compaction the current stall and scope state is injected back
+into the lead's context. `routing: "observe"` (default) logs and annotates
+without blocking; `routing: "enforce"` throws on the call so it never runs.
+Either way every decision lands in the control log.
+
+- **Command stalls.** The normalized command string (recorded before rtk
+  rewrites it) plus its exit code is the key. The same command failing
+  `stall_commands` times in a row blocks identical retries for every agent,
+  lead included - a different argument string is a different command.
+- **File stalls.** A file edited `stall_edits` times by one sidekick agent
+  without a green verification run moves to the lead. A passing
+  verification command (test/typecheck/lint/build-shaped) resets the clock.
+- **Scope.** With a `graft/` index in the project, a sidekick's first edit of
+  a file measures its dependents (`skeleton` + `callers`), and every third
+  sidekick edit re-measures the working diff (`graft blast`, offline-wrapped
+  like every graft call). Files or diffs with more than `grunt_max_blast`
+  dependents are lead territory. No index means scope is *unknown*, and
+  unknown never blocks - it is logged as unknown.
+- **Protected paths.** `protected_paths` prefixes are sidekick-forbidden
+  regardless of measurements (migrations, deploy manifests). The lead can
+  still edit them with owner approval; only escalation sits above the lead.
+
+## Work orders (seats <-> harness)
+
+A seat layer (a Chief of Staff / Engineering Lead setup, or anything that can
+write a file) hands work to the harness through `.fusion/inbox/` and reads
+outcomes from `.fusion/outbox/` - no pasting briefs between chats.
+
+```
+oc-fusion work submit order.md   # validate + file into .fusion/inbox/
+oc-fusion work list              # pending/claimed/done, from work-orders.json
+oc-fusion work results           # the outbox envelopes
+```
+
+`examples/work-order.md` is a fill-in skeleton for the brief format, and
+`examples/seats.md` is a full generic seat layer (Chief of Staff plus seven
+reporting seats, all `<…>` placeholders) for anyone who wants the layer that
+writes these orders. `.fusion/` itself is created by the harness at runtime
+and is gitignored, so nothing to set up by hand.
+
+The contract is small: frontmatter with `id` and `seat`, an `## Objective`
+section, and an `## Acceptance` section naming the checks that make it done.
+Inside a session the lead uses the `work_order` tool - `list`, `accept`,
+`report` - and `report` writes an envelope carrying the files touched, the
+checks run with their exit codes, and the routing evidence (stalls, scope).
+An `escalate` call also writes a `needs-decision` envelope to the outbox, so
+escalations flow back up on their own. Claim state lives in
+`.fusion/work-orders.json`; a second session accepting a claimed order is
+refused.
+
+The split stays where it was: seats decide, the harness executes, and money,
+publishing, deploys and external contact wait for the owner no matter what a
+brief asks for.
 
 ## Graft (the repo graph)
 
