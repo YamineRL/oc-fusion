@@ -117,7 +117,18 @@
       "model": "merge-gateway/zai/glm-5.3",
       "variant": "high",
       "prompt": "{file:./prompts/fusion.md}",
-      "steps": 400
+      "steps": 400,
+      // The v2 runner gives an agent with no ruleset a deny-everything
+      // default, so this block is load-bearing, not a nicety. Keep it in this
+      // file rather than another config's agent map: a later config source's
+      // "agent" object replaces this whole map instead of merging, and the
+      // other agents vanish with it.
+      "permission": {
+        "*": "allow",
+        "doom_loop": "deny",
+        "external_directory": "ask",
+        "question": "allow"
+      }
     },
     "scout": {
       "description": "Read-only explorer on the local model. Use for finding files, tracing call sites, summarizing how something works. Returns findings, never patches.",
@@ -152,7 +163,14 @@
       "mode": "subagent",
       "model": "llamacpp/fusion-sidekick",
       "prompt": "{file:./prompts/grunt.md}",
-      "steps": 80
+      "steps": 80,
+      // Same deny-everything default as fusion: no ruleset, no tool calls.
+      "permission": {
+        "*": "allow",
+        "doom_loop": "deny",
+        "external_directory": "ask",
+        "question": "allow"
+      }
     },
     "oracle": {
       "description": "Frontier model at max reasoning. Use ONLY for a genuinely hard, isolated problem: a subtle bug, a design trade-off, an algorithm. Costs real money per call.",
