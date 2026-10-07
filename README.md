@@ -81,12 +81,13 @@ project, it often skips the file read entirely: the graph answers with exact
 file:line and the crux lines inline, so a find/trace becomes one tool call
 instead of a browse.
 
-`critic` is set by its own knob (`local | flash | lead`), independent of the
-sidekick. The default local critic can be the weakest model in your fleet
-auditing the strongest editor — backwards for subtle edits. `lead` re-reviews
-at low effort, typically well under a cent per review. On a lead with no
-reasoning levels (union-alpha) `critic lead` self-reviews with no variant —
-same model, its default effort.
+The `critic` knob picks the reviewer (`local | strata | flash | lead`),
+independent of the sidekick. The default is `strata`: the Strata model on
+:8082 at high effort, free. A local critic can be the weakest model in your
+fleet auditing the strongest editor, which is backwards for subtle edits.
+`lead` re-reviews at low effort, typically well under a cent per review. On
+a lead with no reasoning levels (union-alpha) `critic lead` self-reviews
+with no variant: same model, its default effort.
 
 ## Install
 
@@ -104,14 +105,15 @@ Then follow "Running it".
 ### Option B: one-prompt install
 
 Open opencode in any directory and paste this. The agent clones the repo,
-installs the plugin dependency, wires your llama-server model into the config,
-and puts both commands on your PATH. It asks before anything that touches
-files outside the repo.
+installs the plugin dependency, sets up Strata (or wires in your llama-server)
+as the local sidekick, and puts both commands on your PATH. It asks before
+anything that touches files outside the repo.
 
 ````text
 Install the oc-fusion harness from https://github.com/YamineRL/oc-fusion
 into ~/oc-fusion (clone if the directory does not exist; pull if it does).
-Then:
+The default local sidekick is Strata (https://github.com/Niko1221/Strata).
+llama.cpp also works. Then:
 
 1. Run `npm --prefix ~/oc-fusion/.opencode install` and confirm it succeeds.
 2. Install the repo-graph layer: `npm install -g @nanonets/graft` (Node 20+).
@@ -119,37 +121,46 @@ Then:
 3. Install the output layer: `brew install rtk` (or
    `cargo install --git https://github.com/rtk-ai/rtk`, or a prebuilt binary
    from its releases). Also part of the harness, not an extra.
-2. Find my llama-server setup:
-   - Look for a systemd user unit named llama-server.service under
-     ~/.config/systemd/user/ (also check `systemctl --user list-units |
-     grep llama` if the file is not there). If none exists, ask me how my
-     local inference server runs and stop until I answer.
-   - From the unit's ExecStart line, note the port (default 8080) and the
-     context size -c (default 4096).
-   - Get the model's wire id from the RUNNING server, not the unit (units
-     often omit --alias): `ps -eo args= | grep llama-server` and take the
-     --alias value, or the .gguf basename from --model/-m. If the server is
-     not running, start it with `systemctl --user start llama-server` and
-     retry; if you still cannot see it, ask me.
-   - Find my API key: if the unit references --api-key-file, use that path;
-     otherwise if my server needs no key, tell me and skip apiKey entirely;
-     otherwise create ~/.config/llama-server/api-key with a random hex
-     string and tell me you did.
-3. Edit ~/oc-fusion/opencode.jsonc:
-   - Set baseURL to http://127.0.0.1:<port>/v1
-   - Point apiKey at my key file (or remove it if my server needs no key)
-   - Replace the three sidekick alias "id" fields with the wire id you found
-     (all three identical)
-4. Edit ~/oc-fusion/fusion.jsonc: if my model's chat template accepts
-   reasoning_effort levels other than low/medium/high, adjust
-   "local_efforts" to match; otherwise leave it.
-5. Add ~/oc-fusion/bin to my PATH permanently. My shell is
+4. Check my PC and show me the result: GPU and VRAM (`nvidia-smi`, or
+   `lspci` and /sys/class/drm/card*/device/mem_info_vram_total for AMD),
+   and RAM (`free -g`).
+5. Set up Strata as the sidekick:
+   - If `curl -s http://127.0.0.1:8082/health` answers, Strata is already
+     running. Go to the last bullet of this step.
+   - Otherwise, ask me before you install it: the model download is
+     70-110 GB. Then follow Strata's docs/AI_SETUP.md, with `--no-start`.
+   - Pick the model from my RAM, as Strata's table does: 96 GB or more:
+     `--family qwen --model IQ3_S`. 64 GB: `--family qwen --model IQ3_XXS`
+     (the oc-fusion default; IQ2_XS is faster). 48 GB: `--family qwen
+     --model IQ2_XS`. 32 GB: `--family coder` (Coder IQ1_M). If I mainly
+     write code, offer the Coder at any RAM size.
+   - Serve on port 8082 with a key, so Strata does not clash with
+     llama-server on 8080. If ~/.config/strata/api-key does not exist,
+     write a random hex string to it (chmod 600). Pass `--port 8082
+     --api-key=<that key>` to Strata's setup. Start the server as its
+     docs/AI_SETUP.md says, and poll /health until "loaded" is true.
+   - Read "model" and "max_context" from /health. In
+     ~/oc-fusion/opencode.jsonc, provider "strata": for the Coder, set
+     models.strata-coder "id" and "limit.context" from them; for any other
+     model, set models.strata-iq3 instead. Keep the alias names.
+   - In ~/oc-fusion/fusion.jsonc, set "sidekick" to "strata", or to
+     "strata-coder" for the Coder. Leave "critic" at "strata".
+6. Optional, only if I already run llama-server: find
+   ~/.config/systemd/user/llama-server.service. From its ExecStart, note the
+   port and the context size -c. Get the model's wire id from the RUNNING
+   server (`ps -eo args= | grep llama-server`, the --alias value or the
+   .gguf basename). Do not start or restart it. Set provider "llamacpp"
+   baseURL to http://127.0.0.1:<port>/v1, point apiKey at its
+   --api-key-file (or remove apiKey if it needs no key), and set the three
+   fusion-sidekick alias "id" fields to that wire id. Strata and
+   llama-server share the GPU: run one at a time.
+7. Add ~/oc-fusion/bin to my PATH permanently. My shell is
    <fish|bash|zsh>: use fish_add_path for fish, or append the export to the
    right rc file for bash/zsh.
-6. Verify: run `oc-fusion doctor` and show me the output. It should report
-   the port, the context ceiling, the resident model, and graft + rtk lines
+8. Verify: run `oc-fusion doctor` and show me the output. It should report
+   the Strata model, its context, the key file, and graft + rtk lines
    without warnings.
-7. Do not start a session yet. Report what you did, what you guessed, and
+9. Do not start a session yet. Report what you did, what you guessed, and
    what I should change (especially the lead model in fusion.jsonc "base"
    if I do not want the default).
 
@@ -193,8 +204,8 @@ Edit `fusion.jsonc`, or use the CLI:
 ```
 oc-fusion status                 # current panel + what is actually resident
 oc-fusion base <model>           # the lead; see the table in fusion.jsonc
-oc-fusion sidekick local|local-fast|local-deep|glm|deepseek
-oc-fusion critic local|flash|lead
+oc-fusion sidekick local|local-fast|local-deep|glm|deepseek|strata|strata-coder
+oc-fusion critic local|strata|flash|lead
 oc-fusion reasoning low|medium|high|xhigh|max
 oc-fusion speed normal|fast
 oc-fusion escalation advise|run|fable
@@ -205,7 +216,7 @@ oc-fusion routing observe|enforce
 oc-fusion work submit|list|results
 oc-fusion graft <cmd> [args...]  # the repo graph, offline-wrapped (see Graft)
 oc-fusion usage                  # per-agent token + cost accounting
-oc-fusion doctor                 # check the config against the llama-server unit
+oc-fusion doctor                 # check the config against Strata and the llama-server unit
 ```
 
 Changes apply on the next opencode start.
@@ -220,7 +231,21 @@ vendor `-fast` twins, `speed: fast` uses them; otherwise fast means one notch
 less reasoning and a tighter step budget, and the plugin says so on startup
 rather than pretending otherwise.
 
+## Strata
+
+[Strata](https://github.com/Niko1221/Strata) is the default local sidekick.
+It serves one model on `127.0.0.1:8082` and answers every model name with
+it. The API key file is `~/.config/strata/api-key`. The plugin sends the
+panel's `local_efforts` to Strata in `chat_template_kwargs`, the same field
+llama.cpp reads. Strata and llama-server share the GPU, so run one at a
+time. `oc-fusion doctor` reads `/health` and warns when the served model or
+its context disagree with the panel.
+
 ## Your local server is the source of truth
+
+This section applies to llama.cpp. For Strata, the plugin sends the
+configured id unchanged, never probes residency, and skips the guard:
+Strata answers any model name and never evicts.
 
 The harness parses your llama-server systemd unit at startup rather than
 duplicating its flags, and adapts to it:
@@ -245,7 +270,11 @@ requirements: tool calling, reasoning, and a chat template that accepts
 
 ## The eviction guard
 
-lllama-server runs `--models-max 1` in the example unit: naming a model that
+This section applies to llama.cpp. For Strata, the plugin sends the
+configured id unchanged, never probes residency, and skips the guard:
+Strata answers any model name and never evicts.
+
+llama-server runs `--models-max 1` in the example unit: naming a model that
 is not resident **unloads the resident one mid-generation**. A multi-agent
 harness is exactly the wrong shape for that, so there are two defenses:
 
