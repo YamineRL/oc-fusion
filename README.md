@@ -123,17 +123,33 @@ llama.cpp also works. Then:
    from its releases). Also part of the harness, not an extra.
 4. Check my PC and show me the result: GPU and VRAM (`nvidia-smi`, or
    `lspci` and /sys/class/drm/card*/device/mem_info_vram_total for AMD),
-   and RAM (`free -g`).
+   RAM (`free -g`) and free disk.
 5. Set up Strata as the sidekick:
    - If `curl -s http://127.0.0.1:8082/health` answers, Strata is already
      running. Go to the last bullet of this step.
-   - Otherwise, ask me before you install it: the model download is
-     70-110 GB. Then follow Strata's docs/AI_SETUP.md, with `--no-start`.
-   - Pick the model from my RAM, as Strata's table does: 96 GB or more:
-     `--family qwen --model IQ3_S`. 64 GB: `--family qwen --model IQ3_XXS`
-     (the oc-fusion default; IQ2_XS is faster). 48 GB: `--family qwen
-     --model IQ2_XS`. 32 GB: `--family coder` (Coder IQ1_M). If I mainly
-     write code, offer the Coder at any RAM size.
+   - Otherwise, clone https://github.com/Niko1221/Strata and run its own
+     check (`./setup.sh --check`; it installs only Python and a .venv). It
+     reports the GPU, VRAM, RAM and whether this PC can run Strata. Strata
+     needs a supported GPU with 12 GB of VRAM or more (an 8 GB NVIDIA card
+     runs, slowly).
+   - Pick the size from my RAM and VRAM together, as Strata's README and
+     docs/MODELS.md say. In normal mode a size fits when RAM is at least
+     its experts plus about 10 GB (experts: Q2_0 34 GB, IQ2_XS 35.5 GB,
+     IQ3_XXS 43 GB, IQ3_S 50 GB, Coder 23 GB). Take IQ3_XXS or better when
+     it fits:
+     - 96 GB RAM or more: `--family qwen --model IQ3_S`.
+     - 64 GB: `--family qwen --model IQ3_XXS` (the oc-fusion default;
+       IQ3_S fits with little else open; IQ2_XS is faster).
+     - 48 GB: `--family qwen --model IQ2_XS` (Q2_0 is the fastest).
+     - 32 GB: the experts do not fit in RAM, so setup uses its low-RAM
+       mode and VRAM decides. With a 24 GB card: `--family qwen --model
+       IQ2_XS` (or Q2_0) for general use, or the Coder. With a 12-16 GB
+       card: only `--family coder` (Coder IQ1_M), and it is much slower.
+     More VRAM makes every size faster and raises setup's default context
+     (32768 under 14 GB of VRAM, 65536 under 20 GB, else 131072). If I
+     mainly write code, offer the Coder. Show me your pick and the reason.
+   - Ask me before you install: the model download is 70-110 GB. Then
+     follow Strata's docs/AI_SETUP.md, with `--no-start`.
    - Serve on port 8082 with a key, so Strata does not clash with
      llama-server on 8080. If ~/.config/strata/api-key does not exist,
      write a random hex string to it (chmod 600). Pass `--port 8082
@@ -240,6 +256,11 @@ panel's `local_efforts` to Strata in `chat_template_kwargs`, the same field
 llama.cpp reads. Strata and llama-server share the GPU, so run one at a
 time. `oc-fusion doctor` reads `/health` and warns when the served model or
 its context disagree with the panel.
+
+The model size depends on RAM and VRAM together. RAM decides which sizes
+fit, VRAM decides the speed, the default context, and what runs in Strata's
+low-RAM mode on a 32 GB PC. Option B above applies the rules from Strata's
+README and [docs/MODELS.md](https://github.com/Niko1221/Strata/blob/main/docs/MODELS.md).
 
 ## Your local server is the source of truth
 
