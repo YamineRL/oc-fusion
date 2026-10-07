@@ -19,7 +19,8 @@ design: strongest affordable brain, cheapest possible hands.
 
 Every knob is honest about what it does, and every claim in this README was
 measured on the reference setup (a 27B-class quantized model on a 16 GB card
-at 45k context), not extrapolated.
+at 45k context), not extrapolated. Strata speed numbers are Strata's own
+measurements and are marked as such.
 
 ## The idea
 
@@ -35,7 +36,7 @@ oc-fusion is that shape with a different cost structure:
 |          | Devin Fusion       | oc-fusion, on-par               | oc-fusion, frugal | Cost (in/out per M) |
 |----------|--------------------|---------------------------------|-------------------|---------------------|
 | Lead     | Claude Fable 5.1   | same class (Fable / Opus / Astra) | GLM-5.3 (the floor) | $0.70/$2.20 … $10/$50 |
-| Sidekick | SWE-2 (medium)     | your own GGUF, or a flash-class API model | same | **$0** or ~$0.03/$0.07 |
+| Sidekick | SWE-2 (medium)     | Strata (125B MoE) or your own GGUF, or a flash-class API model | same | **$0** or ~$0.03/$0.07 |
 | Repo map | (closed)           | Graft, local per-repo graph      | same              | **$0**              |
 | Output   | (closed)           | rtk, compresses command output   | same              | **$0**              |
 | Escalation | (none)           | Claude Code (subscription)      | same              | $0 gateway          |
@@ -64,6 +65,24 @@ The sidekick is where the money is. If you run a local inference server at
 all, the marginal cost of a sidekick token is zero — and the harness
 discovers whatever model your server has resident, so it never asks for a
 model that isn't loaded.
+
+### What Strata adds
+
+Until now, a free local sidekick meant a model that fits in VRAM: on a
+16 GB card, a 27B-class quantized model (the reference setup above).
+[Strata](https://github.com/Niko1221/Strata) removes that limit. It runs
+Qwen3.8-Flash-Next, a 125-billion-parameter mixture-of-experts model, on one
+NVIDIA or AMD card with 12 GB of VRAM or more plus system RAM. The experts
+stay in RAM and the dense weights go to the card. The sidekick tier moves
+from a 27B-class model to one that usually needs a server, still at $0 per
+token, and nothing leaves your PC.
+
+Strata's own measurements, on an RTX 5070 (12 GB) with 64 GB of RAM:
+IQ3_XXS, the oc-fusion default, writes 62 tokens/s and reads a 32K-token
+prompt at 1,750 tokens/s. IQ3_S, which matches the full model on the
+published tests, writes 53 tokens/s. Your RAM and VRAM decide which size
+fits (see [Strata](#strata) below). Strata is the default sidekick, and
+llama.cpp stays fully supported.
 
 ## The five roles
 
