@@ -107,6 +107,41 @@
           "cost": { "input": 0, "output": 0 }
         }
       }
+    },
+    // Strata engine (github.com/Niko1221/Strata), Qwen3.8-Flash-Next Coder
+    // IQ1_M. Separate port and key from llama-server. Selected with
+    // `oc-fusion sidekick strata`.
+    "strata": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Strata (local)",
+      "options": {
+        "baseURL": "http://127.0.0.1:8082/v1",
+        "apiKey": "{file:~/.config/strata/api-key}"
+      },
+      "models": {
+        // IQ3_XXS general model: what unit strata-iq3 serves (on at boot).
+        "strata-iq3": {
+          "id": "qwen3.8-flash-next-iq3_xxs",
+          "name": "Strata IQ3_XXS",
+          "tool_call": true,
+          "reasoning": true,
+          "temperature": false,
+          "options": { "reasoning_effort": "medium" },
+          "limit": { "context": 98304, "output": 16384 },
+          "cost": { "input": 0, "output": 0 }
+        },
+        // Coder IQ1_M: only when unit strata runs instead of strata-iq3.
+        "strata-coder": {
+          "id": "qwen3.8-flash-next-coder-iq1_m",
+          "name": "Strata Coder (IQ1_M)",
+          "tool_call": true,
+          "reasoning": true,
+          "temperature": false,
+          "options": { "reasoning_effort": "medium" },
+          "limit": { "context": 32768, "output": 16384 },
+          "cost": { "input": 0, "output": 0 }
+        }
+      }
     }
   },
 
@@ -133,7 +168,7 @@
     "scout": {
       "description": "Read-only explorer on the local model. Use for finding files, tracing call sites, summarizing how something works. Returns findings, never patches.",
       "mode": "subagent",
-      "model": "llamacpp/fusion-sidekick",
+      "model": "strata/strata-iq3",
       "prompt": "{file:./prompts/scout.md}",
       "steps": 60,
       "permission": {
@@ -161,7 +196,7 @@
     "grunt": {
       "description": "Mechanical editor on the local model. Use for well-specified changes: renames, applying a described patch, wiring boilerplate, fixing a failing test whose cause is known.",
       "mode": "subagent",
-      "model": "llamacpp/fusion-sidekick",
+      "model": "strata/strata-iq3",
       "prompt": "{file:./prompts/grunt.md}",
       "steps": 80,
       // Same deny-everything default as fusion: no ruleset, no tool calls.

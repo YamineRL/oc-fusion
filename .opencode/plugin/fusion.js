@@ -7,12 +7,16 @@
 // --models-max 1, so naming a model that is not resident evicts the resident
 // one mid-generation. Every local alias therefore sends the same wire id, and
 // the guard below refuses (or warns about) anything else.
+//
+// Dual plugin shape: OpenCode v2 calls `default.setup(context)`; v1 hosts
+// call `default.server(input)` (detect mode) or the named `server` export
+// (iterating loaders). Both bodies share `resolveFusion(directory)` below so
+// the routing math exists once.
 
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { spawn } from "node:child_process";
-import { tool } from "@opencode-ai/plugin";
+import { spawn, spawnSync } from "node:child_process";
 import {
   normalizeCommand,
   isVerificationCommand,
@@ -67,6 +71,12 @@ const SIDEKICKS = {
   "local-deep": "llamacpp/fusion-sidekick-deep",
   glm:          "merge-gateway/zai/glm-5.3-flash",
   deepseek:     "merge-gateway/deepseek/deepseek-v4-flash",
+  // Strata engine (github.com/Niko1221/Strata) on its own port. Its own
+  // provider, not llamacpp, so the resident-id rewrite and eviction guard
+  // never touch it. "strata" is the IQ3_XXS general model (unit strata-iq3,
+  // on at boot). "strata-coder" needs the Coder unit (strata) running instead.
+  strata:         "strata/strata-iq3",
+  "strata-coder": "strata/strata-coder",
 };
 
 // The critic reviews the lead's work, so it should not be a weaker model than
@@ -177,6 +187,33 @@ function readProfile(dir) {
   return { ...DEFAULTS };
 }
 
+// Registry id -> declared wire id for one provider's models, read straight
+// from the opencode config files. A plugin's model transform cannot ask the
+// registry for this: transforms replay in registration order on a fresh
+// state on every rebuild, and the post-phase config builtin runs after file
+// plugins, so the model map is always empty when a file plugin's transform
+// runs. The project config wins over the global one.
+function readConfigWireIds(directory, providerID) {
+  const home = os.homedir();
+  const candidates = [
+    path.join(directory, "opencode.json"),
+    path.join(directory, "opencode.jsonc"),
+    path.join(home, ".config", "opencode", "opencode.json"),
+    path.join(home, ".config", "opencode", "opencode.jsonc"),
+  ];
+  const wire = new Map();
+  for (const p of candidates) {
+    try {
+      const cfg = JSON.parse(stripJsonc(fs.readFileSync(p, "utf8")));
+      const models = cfg?.provider?.[providerID]?.models ?? {};
+      for (const [key, entry] of Object.entries(models)) {
+        if (!wire.has(key)) wire.set(key, entry?.modelID ?? entry?.id ?? key);
+      }
+    } catch { /* absent or unparsable config is not a plugin problem */ }
+  }
+  return wire;
+}
+
 // Clamp a requested effort to what this model actually advertises, preferring
 // the nearest level at or below the request. An empty ladder means the model
 // advertises no levels at all: it manages its own effort, so the honest
@@ -245,9 +282,10 @@ function readUnit() {
 
 // Which model is actually resident, read passively from the child server's
 // cmdline. Never probes an inference endpoint, so it cannot trigger a load.
-async function residentModels($) {
+// spawnSync at load time; a plugin has no $ helper on v2.
+function residentModels() {
   try {
-    const txt = await $`ps -eo args=`.text();
+    const txt = spawnSync("ps", ["-eo", "args="], { encoding: "utf8", maxBuffer: 16 * 1024 * 1024 }).stdout ?? "";
     const found = new Map();
     for (const line of txt.split("\n")) {
       if (!/^\s*\S*llama-server\s/.test(line)) continue;
@@ -266,9 +304,12 @@ async function residentModels($) {
   }
 }
 
-// ---------------------------------------------------------------- the plugin
+// ------------------------------------------------- shared setup (both hosts)
 
-export const server = async ({ directory, $ }) => {
+// Everything the two plugin bodies need that does not depend on the host's
+// hook API: profile resolution, local-server discovery, controller state,
+// graft helpers, work orders, the escalate/summarize machinery, the banner.
+function resolveFusion(directory) {
   const profile = readProfile(directory);
   const unit = readUnit();
 
@@ -304,30 +345,110 @@ export const server = async ({ directory, $ }) => {
       ? { model: leadModel, ...(criticEffort ? { variant: criticEffort } : {}) }
       : criticChoice; // null (local) or { model, variant }
 
-  const resident = await residentModels($);
+  const resident = residentModels();
   // The wire id every local alias sends: pinned via the panel, else whatever
   // the running server has resident. Discovery means the harness cannot ask
   // the server for a model it does not have loaded.
   const localWireId = profile.local_model ?? [...resident.keys()][0] ?? null;
+  // Registry id -> declared wire id, from the config files. Plugin
+  // transforms run before the post-phase config builtin on every state
+  // rebuild, so the registry is always empty when they run; the files are
+  // the only reliable place to resolve an alias's declared wire id.
+  const cfgWireIds = readConfigWireIds(directory, "llamacpp");
   // Router presets put context flags on the child, not the systemd unit.
   const localRuntime = resident.get(localWireId);
   if (!localWireId) {
     console.error("[fusion] no local model pinned and none resident (is llama-server running?). Local agents will fail until it is up.");
   }
 
-  // Track which agent owns a session so tool-output compression only fires
-  // for the paid tiers. tool.execute.after does not carry the agent itself.
-  const agentBySession = new Map();
-  // Message IDs already written to the usage log this run (see event hook).
-  const loggedMessages = new Set();
+  // -------------------------------------------- live resident read
+  //
+  // `resident` above is a load-time snapshot from ps. The resident model
+  // can change under a running server (the panel can swap it, or the
+  // server can come up after plugin load), so every decision that puts a
+  // model name on the wire re-reads it: GET /v1/models is the only passive
+  // probe; it never names a model, so it cannot start a load or evict one.
+  // Answers cache for a few seconds; failures are not cached, so a
+  // recovering server is seen on the next request.
+  const RESIDENT_TTL_MS = 3000;
+  const live = { at: 0, url: "", ids: null, inflight: null, auth: null };
+
+  // Header candidates for the probe: the request's own headers first
+  // (they already carry the provider key when it was configured), then
+  // each usable line of the key file as a Bearer token.
+  function authCandidates(headers) {
+    const base = new Headers(headers ?? undefined);
+    const out = [base];
+    if (!base.get("authorization")) {
+      try {
+        for (const line of fs.readFileSync(API_KEY_FILE, "utf8").split("\n")) {
+          const k = line.trim();
+          if (!k || k.startsWith("#")) continue;
+          const h = new Headers(base);
+          h.set("authorization", `Bearer ${k}`);
+          out.push(h);
+        }
+      } catch {}
+    }
+    if (live.auth) return [live.auth, ...out.filter((h) => h !== live.auth)];
+    return out;
+  }
+
+  async function readResidentLive(baseURL, headers) {
+    const url = new URL("/v1/models", baseURL).toString();
+    if (live.ids && live.url === url && Date.now() - live.at < RESIDENT_TTL_MS) return live.ids;
+    if (live.inflight?.url === url) return live.inflight.p;
+    const p = (async () => {
+      try {
+        let res = null;
+        for (const h of authCandidates(headers)) {
+          res = await fetch(url, { headers: h, signal: AbortSignal.timeout(2000) });
+          if (res.ok) { live.auth = h; break; }
+          if (res.status !== 401 && res.status !== 403) { res = null; break; }
+        }
+        if (!res?.ok) return null;
+        const data = await res.json();
+        const ids = new Set();
+        for (const m of data?.data ?? []) {
+          if (m?.status?.value === "loaded" && m?.id) ids.add(String(m.id));
+        }
+        // An empty answer is transient (a model may still be loading), so
+        // only a non-empty read is cached; the next call re-probes.
+        if (ids.size) {
+          live.at = Date.now();
+          live.url = url;
+          live.ids = ids;
+        }
+        return ids;
+      } catch {
+        return null;
+      } finally {
+        live.inflight = null;
+      }
+    })();
+    live.inflight = { url, p };
+    return p;
+  }
+
+  // The wire id it is safe to send: the pinned local_model when it is
+  // still resident, else the resident model. null means "do not send":
+  // no resident model, an unreadable server, or a pin that would evict.
+  let lastWireId = localWireId;
+  function pickWireId(ids) {
+    if (!ids || !ids.size) return null;
+    if (profile.local_model) return ids.has(profile.local_model) ? profile.local_model : null;
+    if (lastWireId && ids.has(lastWireId)) return lastWireId;
+    lastWireId = ids.values().next().value;
+    return lastWireId;
+  }
 
   // ------------------------------------------------- evidence routing
   //
   // The controller: measured stalls and measured scope pick the tier, not
   // the lead's judgment. State lives in plugin memory (survives compaction)
   // and is mirrored to .fusion/control.jsonl (survives restarts). Limits
-  // come from the panel; "observe" annotates and logs, "enforce" throws in
-  // tool.execute.before so the call never runs.
+  // come from the panel; "observe" annotates and logs, "enforce" refuses the
+  // call (v1 throws, v2 redirects to the fusion_blocked tool; see gateV2).
   const ctrl = makeControllerState();
   const fusionDir = path.join(directory, ".fusion");
   const controlLog = path.join(fusionDir, "control.jsonl");
@@ -342,18 +463,6 @@ export const server = async ({ directory, $ }) => {
     } catch (e) {
       console.error(`[fusion] control log write failed: ${e.message}`);
     }
-  }
-
-  // One decision path for every gate: enforce throws (the call never runs and
-  // the agent gets the reason as a tool error); observe queues a notice that
-  // the after-hook appends to that call's output. Either way it is logged.
-  function gate(callID, kind, reason, extra = {}) {
-    logControl({ kind: profile.routing === "enforce" ? `${kind}-blocked` : `${kind}-observed`, ...extra, reason });
-    if (profile.routing === "enforce") {
-      throw new Error(`[fusion routing] ${reason}`);
-    }
-    if (ctrl.notices.size > 200) ctrl.notices.delete(ctrl.notices.keys().next().value);
-    ctrl.notices.set(callID, `[fusion routing: observe] would block: ${reason}`);
   }
 
   // graft runs through the harness wrapper (unshare: no network for it or its
@@ -410,6 +519,7 @@ export const server = async ({ directory, $ }) => {
   // up-front estimate because it measures what actually changed. Latched into
   // ctrl.scope; a green verification run clears it.
   let blastChecks = 0;
+  const blastTick = () => ++blastChecks;
   async function measureDiffScope() {
     const b = await graftJson(["blast", "--format", "json", "--no-refresh", "--depth", "2"]);
     if (!b || !Array.isArray(b.impacted)) return null;
@@ -482,7 +592,6 @@ export const server = async ({ directory, $ }) => {
     return out;
   }
 
-
   const banner = [
     `[fusion] lead ${leadModel}${leadEffort ? ` (${leadEffort})` : ""}`,
     `sidekick ${sidekick}${sidekickIsLocal ? " [free]" : ""}`,
@@ -500,19 +609,365 @@ export const server = async ({ directory, $ }) => {
     }`,
     `speed ${profile.speed}`,
   ].join(" | ");
-  console.error(banner);
-  if (fast && !FAST_TWIN[base.model]) {
-    console.error(
-      leadEffort
-        ? `[fusion] note: the gateway publishes no -fast twin for ${base.model}; fast = one notch less reasoning + tighter step budget.`
-        : `[fusion] note: ${base.model} advertises no reasoning levels, so fast = just the tighter step budget for it.`,
-    );
+
+  function printBanner() {
+    console.error(banner);
+    if (fast && !FAST_TWIN[base.model]) {
+      console.error(
+        leadEffort
+          ? `[fusion] note: the gateway publishes no -fast twin for ${base.model}; fast = one notch less reasoning + tighter step budget.`
+          : `[fusion] note: ${base.model} advertises no reasoning levels, so fast = just the tighter step budget for it.`,
+      );
+    }
+    if (unit.ctx) {
+      console.error(`[fusion] llama-server unit: ctx ${unit.ctx}, parallel ${unit.parallel}, models-max ${unit.modelsMax}, idle-sleep ${unit.idle}s`);
+    }
+    if (sidekickIsLocal && resident.size && !resident.has(localWireId)) {
+      console.error(`[fusion] WARNING: sidekick wants "${localWireId}" but resident is "${[...resident.keys()].join(", ")}". First sidekick call will evict it.`);
+    }
   }
-  if (unit.ctx) {
-    console.error(`[fusion] llama-server unit: ctx ${unit.ctx}, parallel ${unit.parallel}, models-max ${unit.modelsMax}, idle-sleep ${unit.idle}s`);
+
+  // ------------------------------------------------- shared tool bodies
+  //
+  // Both hosts normalize their tool ctx to { agent, sessionID, directory,
+  // ask, signal } and get the v1-shaped { title, output, metadata } back;
+  // each host maps that onto its own result contract.
+
+  function buildBrief(args, t) {
+    const files = (args.files ?? []).filter(Boolean);
+    return [
+      `# Escalation from opencode (lead: ${leadModel})`,
+      "",
+      `Working directory: ${t.directory}`,
+      "",
+      "## Problem",
+      args.problem.trim(),
+      "",
+      "## What I already tried, and what it ruled out",
+      args.tried.trim(),
+      "",
+      ...(files.length ? ["## Relevant files", ...files.map((f) => `- ${f}`), ""] : []),
+      "## The question I need answered",
+      args.question.trim(),
+      "",
+      "---",
+      "Written by the opencode fusion harness. The lead model above could not",
+      "resolve this, so it was handed to you rather than to a paid frontier model.",
+      "",
+    ].join("\n");
   }
-  if (sidekickIsLocal && resident.size && !resident.has(localWireId)) {
-    console.error(`[fusion] WARNING: sidekick wants "${localWireId}" but resident is "${[...resident.keys()].join(", ")}". First sidekick call will evict it.`);
+
+  function runClaudeCode(brief, t) {
+    return new Promise((resolve, reject) => {
+      const model = profile.claude_model;
+      // Read-only tools only. A non-interactive `claude -p` cannot be granted
+      // approvals mid-run, so anything not pre-allowed just fails and it
+      // reasons blind. Reading is what makes the answer grounded; writing is
+      // the lead's job once the answer comes back.
+      const argv = [
+        "-p", brief,
+        "--output-format", "text",
+        "--allowed-tools", "Read,Glob,Grep,WebSearch,WebFetch",
+      ];
+      if (model) argv.push("--model", String(model));
+
+      const child = spawn("claude", argv, {
+        cwd: t.directory,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+
+      let out = "", err = "";
+      // Claude Code can think for a while; give it room but never hang forever.
+      const timer = setTimeout(() => { child.kill("SIGTERM"); }, 15 * 60 * 1000);
+      const onAbort = () => { child.kill("SIGTERM"); };
+      t.signal?.addEventListener?.("abort", onAbort, { once: true });
+
+      child.stdout.on("data", (d) => { out += d; });
+      child.stderr.on("data", (d) => { err += d; });
+      child.on("error", (e) => {
+        clearTimeout(timer);
+        reject(new Error(`could not run \`claude\`: ${e.message}`));
+      });
+      child.on("close", (code) => {
+        clearTimeout(timer);
+        t.signal?.removeEventListener?.("abort", onAbort);
+        if (code === 0 && out.trim()) return resolve(out.trim());
+        reject(new Error(`claude exited ${code}${err.trim() ? `: ${err.trim().slice(0, 500)}` : ""}`));
+      });
+    });
+  }
+
+  // escalate() body, host-agnostic. `t.ask` must throw on decline (v1 ctx.ask
+  // already does; the v2 adapter throws on deny/timeout/missing channel).
+  async function escalateImpl(args, t) {
+    const brief = buildBrief(args, t);
+
+    if (profile.escalation === "run") {
+      await t.ask({
+        permission: "fusion_escalate",
+        patterns: ["claude -p"],
+        always: ["claude -p"],
+        metadata: { question: args.question },
+      });
+      const answer = await runClaudeCode(brief, t);
+      return {
+        title: "Escalated to Claude Code",
+        output:
+          `Claude Code answered (billed to your subscription, no gateway spend):\n\n${answer}`,
+        metadata: { route: "claude -p" },
+      };
+    }
+
+    // Default: no spend anywhere. Save the brief and tell the user.
+    const dir = path.join(t.directory, ".fusion");
+    fs.mkdirSync(dir, { recursive: true });
+    const file = path.join(dir, `escalation-${new Date().toISOString().replace(/[:.]/g, "-")}.md`);
+    fs.writeFileSync(file, brief);
+    const rel = path.relative(t.directory, file);
+
+    // Escalations flow back up: write the same brief as a
+    // needs-decision envelope in the outbox so the seat layer can pick
+    // it up without anyone pasting between chats.
+    try {
+      const escId = path.basename(file, ".md");
+      fs.mkdirSync(outboxDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(outboxDir, `${escId}.md`),
+        renderResultEnvelope({
+          id: escId,
+          status: "needs-decision",
+          seat: "harness",
+          session: t.sessionID,
+          leadModel,
+          summary: `Escalation brief: ${args.question.trim().slice(0, 200)}`,
+          files: (args.files ?? []).filter(Boolean),
+          checks: ctrl.checks.slice(-10),
+          stalls: stallsSummary(),
+          note: `Full brief: ${rel}\n\n${args.question.trim()}`,
+        }),
+      );
+    } catch (e) {
+      console.error(`[fusion] outbox write failed: ${e.message}`);
+    }
+
+    // Interactive by design: no -p or --output-format (the human wants
+    // a conversation, not print-and-exit) and no --allowed-tools (they
+    // can approve tools live, so restricting them would only remove
+    // capability). --model is the one flag worth carrying over from
+    // runClaudeCode so a pinned claude_model applies to both routes.
+    const modelFlag = profile.claude_model ? ` --model ${String(profile.claude_model)}` : "";
+    return {
+      title: "Escalate to Claude Code",
+      output:
+        `I cannot crack this, and escalating to a frontier model would spend gateway\n` +
+        `balance. The handoff brief is saved to ${rel}.\n\n` +
+        `To hand it to Claude Code (subscription, no gateway spend):\n\n` +
+        `    claude${modelFlag} "$(cat ${rel})"\n\n` +
+        `or open \`claude\` in this directory and paste the brief.\n\n` +
+        `--- brief ---\n${brief}\n\n` +
+        `STOP HERE. Report this to the user and do not keep retrying the same\n` +
+        `approach. If they answer the question, continue from their answer.`,
+      metadata: { route: "advise", file },
+    };
+  }
+
+  async function workOrderImpl(args, t) {
+    const agent = t.agent;
+    if (agent && agent !== "fusion") {
+      return { title: "Work orders", output: "Only the lead seat manages work orders.", metadata: {} };
+    }
+
+    if (args.action === "list") {
+      const orders = listInbox();
+      if (!orders.length) {
+        return { title: "Work orders", output: `No work orders in ${path.relative(t.directory, inboxDir)}/.`, metadata: { count: 0 } };
+      }
+      const lines = orders.map((o) => {
+        const flags = [
+          o.status,
+          o.seat ? `from ${o.seat}` : null,
+          o.errors.length ? `INVALID: ${o.errors.join("; ")}` : null,
+        ].filter(Boolean).join(" - ");
+        return `- ${o.id}${o.title ? ` "${o.title}"` : ""} (${flags})`;
+      });
+      return {
+        title: "Work orders",
+        output: `${orders.length} order(s) in inbox:\n\n${lines.join("\n")}\n\nAccept one with work_order(action="accept", id="<id>").`,
+        metadata: { count: orders.length },
+      };
+    }
+
+    if (!args.id) {
+      return { title: "Work order", output: "id is required for accept and report.", metadata: {} };
+    }
+
+    const inboxFile = path.join(inboxDir, `${args.id}.md`);
+    const orders = readOrders();
+
+    if (args.action === "accept") {
+      if (!fs.existsSync(inboxFile)) {
+        return { title: "Work order", output: `No inbox file for "${args.id}". Run action="list" to see pending orders.`, metadata: {} };
+      }
+      const text = fs.readFileSync(inboxFile, "utf8");
+      const v = validateWorkOrder(text);
+      if (!v.ok) {
+        return { title: "Work order rejected", output: `Invalid work order "${args.id}":\n${v.errors.map((e) => `- ${e}`).join("\n")}\n\nSend it back to the seat with these errors.`, metadata: { errors: v.errors } };
+      }
+      const existing = orders.orders[args.id];
+      if (existing && existing.status === "in_progress" && existing.session !== t.sessionID) {
+        return { title: "Work order claimed", output: `"${args.id}" is already in progress in session ${existing.session}. If that session is dead, delete the entry in .fusion/work-orders.json.`, metadata: { status: existing.status } };
+      }
+      orders.orders[args.id] = {
+        status: "in_progress",
+        seat: v.meta.seat,
+        session: t.sessionID,
+        claimed: new Date().toISOString(),
+      };
+      writeOrders(orders);
+      logControl({ kind: "work-order", id: args.id, action: "accept", seat: v.meta.seat });
+      return {
+        title: `Accepted ${args.id}`,
+        output:
+          `${text}\n\n---\n` +
+          `Work order ${args.id} claimed. Execute within its scope and acceptance checks. ` +
+          `Money, publishing, deploys and external contact still wait for the owner regardless of what the brief asks. ` +
+          `When done - or when a decision is needed - call work_order(action="report", id="${args.id}", status=..., summary=...).`,
+        metadata: { status: "in_progress" },
+      };
+    }
+
+    // report
+    if (!args.status || !args.summary) {
+      return { title: "Work order", output: "report needs both status and summary.", metadata: {} };
+    }
+    const env = renderResultEnvelope({
+      id: args.id,
+      status: args.status,
+      seat: orders.orders[args.id]?.seat ?? null,
+      session: t.sessionID,
+      leadModel,
+      summary: args.summary,
+      note: args.note,
+      files: [...ctrl.filesTouched],
+      checks: ctrl.checks.slice(-10),
+      stalls: stallsSummary(),
+    });
+    fs.mkdirSync(outboxDir, { recursive: true });
+    fs.writeFileSync(path.join(outboxDir, `${args.id}.md`), env);
+    orders.orders[args.id] = {
+      ...(orders.orders[args.id] ?? {}),
+      status: args.status,
+      session: t.sessionID,
+      updated: new Date().toISOString(),
+    };
+    writeOrders(orders);
+    logControl({ kind: "work-order", id: args.id, action: "report", status: args.status });
+    return {
+      title: `Reported ${args.id}`,
+      output: `Result envelope written to ${path.relative(t.directory, outboxDir)}/${args.id}.md (status: ${args.status}). The seat layer reads it from there - stop and let it decide what happens next.`,
+      metadata: { status: args.status },
+    };
+  }
+
+  async function localSummarize({ tool: toolName, middle }) {
+    // llama-server's key file is one key per line; # lines are comments.
+    // Take the first usable line: the raw file puts comments and other keys
+    // into one Authorization header, which fetch rejects.
+    const key = fs
+      .readFileSync(API_KEY_FILE, "utf8")
+      .split(/\r?\n/)
+      .map((l) => l.trim())
+      .find((l) => l && !l.startsWith("#"));
+    if (!key) throw new Error(`no API key found in ${API_KEY_FILE}`);
+    const port = unit.port ?? 8080;
+    const base = `http://127.0.0.1:${port}`;
+    // Same rule as the wire stamp: a load-time name can be stale, so the
+    // resident model is re-read here. A bad read means no summarizer call.
+    const wireId = pickWireId(await readResidentLive(base, { authorization: `Bearer ${key}` }));
+    if (!wireId) throw new Error("no resident model on llama-server; refusing to name one");
+    const res = await fetch(`${base}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` },
+      body: JSON.stringify({
+        model: wireId, // resident model only; never triggers a load
+        stream: false,
+        max_tokens: 1200,
+        chat_template_kwargs: { reasoning_effort: "low" },
+        messages: [
+          {
+            role: "system",
+            content:
+              "You compress tool output for another agent. Report only what is in the text: " +
+              "errors and their locations, names and paths that matter, counts, and the shape of " +
+              "the data. Use a short list. Do not speculate, do not advise, do not add preamble.",
+          },
+          { role: "user", content: `Output of the \`${toolName}\` tool:\n\n${middle.slice(0, 120000)}` },
+        ],
+      }),
+    });
+    if (!res.ok) throw new Error(`llama-server returned ${res.status}`);
+    const json = await res.json();
+    return json?.choices?.[0]?.message?.content?.trim() || null;
+  }
+
+  function appendUsage(line) {
+    try {
+      fs.mkdirSync(fusionDir, { recursive: true });
+      fs.appendFileSync(path.join(fusionDir, "usage.jsonl"), JSON.stringify(line) + "\n");
+    } catch (e) {
+      // Accounting must never break a chat.
+      console.error(`[fusion] usage log write failed: ${e.message}`);
+    }
+  }
+
+  return {
+    profile, unit, base, oracleBase, oracleEffort, fast, leadEffort, leadModel,
+    sidekick, sidekickIsLocal, criticPatch, resident, localWireId, localRuntime,
+    cfgWireIds, readResidentLive, pickWireId,
+    ctrl, fusionDir, controlLog, ordersFile, inboxDir, outboxDir,
+    logControl, graftBin, hasGraft, graftJson, fileScope, blastTick,
+    measureFileScope, measureDiffScope, readOrders, writeOrders, listInbox,
+    stallsSummary, buildBrief, runClaudeCode, localSummarize, appendUsage,
+    banner, printBanner, escalateImpl, workOrderImpl,
+  };
+}
+
+// ============================================================ v1 host
+//
+// The v1 plugin contract (opencode 1.x): the host calls this and consumes the
+// returned hook object. Kept because the Mac still runs v1; the file stays
+// one source of truth for both versions.
+
+export const server = async ({ directory }) => {
+  const F = resolveFusion(directory);
+  const {
+    profile, unit, oracleBase, oracleEffort, fast, leadEffort, leadModel,
+    sidekick, sidekickIsLocal, criticPatch, resident, localWireId, localRuntime,
+    ctrl, inboxDir, outboxDir, logControl, graftBin, hasGraft, fileScope,
+    blastTick, measureFileScope, measureDiffScope, readOrders, writeOrders,
+    listInbox, stallsSummary, appendUsage, banner, printBanner,
+    escalateImpl, workOrderImpl, localSummarize,
+  } = F;
+  const { tool } = await import("@opencode-ai/plugin");
+
+  // Track which agent owns a session so tool-output compression only fires
+  // for the paid tiers. tool.execute.after does not carry the agent itself.
+  const agentBySession = new Map();
+  // Message IDs already written to the usage log this run (see event hook).
+  const loggedMessages = new Set();
+
+  printBanner();
+
+  // One decision path for every gate: enforce throws (the call never runs and
+  // the agent gets the reason as a tool error); observe queues a notice that
+  // the after-hook appends to that call's output. Either way it is logged.
+  function gate(callID, kind, reason, extra = {}) {
+    logControl({ kind: profile.routing === "enforce" ? `${kind}-blocked` : `${kind}-observed`, ...extra, reason });
+    if (profile.routing === "enforce") {
+      throw new Error(`[fusion routing] ${reason}`);
+    }
+    if (ctrl.notices.size > 200) ctrl.notices.delete(ctrl.notices.keys().next().value);
+    ctrl.notices.set(callID, `[fusion routing: observe] would block: ${reason}`);
   }
 
   return {
@@ -542,75 +997,13 @@ export const server = async ({ directory, $ }) => {
             .describe("The single specific question or decision you need answered."),
         },
         async execute(args, ctx) {
-          const brief = buildBrief(args, ctx);
-
-          if (profile.escalation === "run") {
-            await ctx.ask({
-              permission: "fusion_escalate",
-              patterns: ["claude -p"],
-              always: ["claude -p"],
-              metadata: { question: args.question },
-            });
-            const answer = await runClaudeCode(brief, ctx);
-            return {
-              title: "Escalated to Claude Code",
-              output:
-                `Claude Code answered (billed to your subscription, no gateway spend):\n\n${answer}`,
-              metadata: { route: "claude -p" },
-            };
-          }
-
-          // Default: no spend anywhere. Save the brief and tell the user.
-          const dir = path.join(ctx.directory, ".fusion");
-          fs.mkdirSync(dir, { recursive: true });
-          const file = path.join(dir, `escalation-${new Date().toISOString().replace(/[:.]/g, "-")}.md`);
-          fs.writeFileSync(file, brief);
-          const rel = path.relative(ctx.directory, file);
-
-          // Escalations flow back up: write the same brief as a
-          // needs-decision envelope in the outbox so the seat layer can pick
-          // it up without anyone pasting between chats.
-          try {
-            const escId = path.basename(file, ".md");
-            fs.mkdirSync(outboxDir, { recursive: true });
-            fs.writeFileSync(
-              path.join(outboxDir, `${escId}.md`),
-              renderResultEnvelope({
-                id: escId,
-                status: "needs-decision",
-                seat: "harness",
-                session: ctx.sessionID,
-                leadModel,
-                summary: `Escalation brief: ${args.question.trim().slice(0, 200)}`,
-                files: (args.files ?? []).filter(Boolean),
-                checks: ctrl.checks.slice(-10),
-                stalls: stallsSummary(),
-                note: `Full brief: ${rel}\n\n${args.question.trim()}`,
-              }),
-            );
-          } catch (e) {
-            console.error(`[fusion] outbox write failed: ${e.message}`);
-          }
-
-          // Interactive by design: no -p or --output-format (the human wants
-          // a conversation, not print-and-exit) and no --allowed-tools (they
-          // can approve tools live, so restricting them would only remove
-          // capability). --model is the one flag worth carrying over from
-          // runClaudeCode so a pinned claude_model applies to both routes.
-          const modelFlag = profile.claude_model ? ` --model ${String(profile.claude_model)}` : "";
-          return {
-            title: "Escalate to Claude Code",
-            output:
-              `I cannot crack this, and escalating to a frontier model would spend gateway\n` +
-              `balance. The handoff brief is saved to ${rel}.\n\n` +
-              `To hand it to Claude Code (subscription, no gateway spend):\n\n` +
-              `    claude${modelFlag} "$(cat ${rel})"\n\n` +
-              `or open \`claude\` in this directory and paste the brief.\n\n` +
-              `--- brief ---\n${brief}\n\n` +
-              `STOP HERE. Report this to the user and do not keep retrying the same\n` +
-              `approach. If they answer the question, continue from their answer.`,
-            metadata: { route: "advise", file },
-          };
+          return escalateImpl(args, {
+            agent: ctx.agent ?? agentBySession.get(ctx.sessionID),
+            sessionID: ctx.sessionID,
+            directory: ctx.directory,
+            ask: (o) => ctx.ask(o),
+            signal: ctx.abort,
+          });
         },
       }),
 
@@ -648,101 +1041,11 @@ export const server = async ({ directory, $ }) => {
             .describe("For needs-decision / needs-approval: the exact question or authorization the seat must answer."),
         },
         async execute(args, ctx) {
-          const agent = ctx.agent ?? agentBySession.get(ctx.sessionID);
-          if (agent && agent !== "fusion") {
-            return { title: "Work orders", output: "Only the lead seat manages work orders.", metadata: {} };
-          }
-
-          if (args.action === "list") {
-            const orders = listInbox();
-            if (!orders.length) {
-              return { title: "Work orders", output: `No work orders in ${path.relative(ctx.directory, inboxDir)}/.`, metadata: { count: 0 } };
-            }
-            const lines = orders.map((o) => {
-              const flags = [
-                o.status,
-                o.seat ? `from ${o.seat}` : null,
-                o.errors.length ? `INVALID: ${o.errors.join("; ")}` : null,
-              ].filter(Boolean).join(" - ");
-              return `- ${o.id}${o.title ? ` "${o.title}"` : ""} (${flags})`;
-            });
-            return {
-              title: "Work orders",
-              output: `${orders.length} order(s) in inbox:\n\n${lines.join("\n")}\n\nAccept one with work_order(action="accept", id="<id>").`,
-              metadata: { count: orders.length },
-            };
-          }
-
-          if (!args.id) {
-            return { title: "Work orders", output: "id is required for accept and report.", metadata: {} };
-          }
-
-          const inboxFile = path.join(inboxDir, `${args.id}.md`);
-          const orders = readOrders();
-
-          if (args.action === "accept") {
-            if (!fs.existsSync(inboxFile)) {
-              return { title: "Work order", output: `No inbox file for "${args.id}". Run action="list" to see pending orders.`, metadata: {} };
-            }
-            const text = fs.readFileSync(inboxFile, "utf8");
-            const v = validateWorkOrder(text);
-            if (!v.ok) {
-              return { title: "Work order rejected", output: `Invalid work order "${args.id}":\n${v.errors.map((e) => `- ${e}`).join("\n")}\n\nSend it back to the seat with these errors.`, metadata: { errors: v.errors } };
-            }
-            const existing = orders.orders[args.id];
-            if (existing && existing.status === "in_progress" && existing.session !== ctx.sessionID) {
-              return { title: "Work order claimed", output: `"${args.id}" is already in progress in session ${existing.session}. If that session is dead, delete the entry in .fusion/work-orders.json.`, metadata: { status: existing.status } };
-            }
-            orders.orders[args.id] = {
-              status: "in_progress",
-              seat: v.meta.seat,
-              session: ctx.sessionID,
-              claimed: new Date().toISOString(),
-            };
-            writeOrders(orders);
-            logControl({ kind: "work-order", id: args.id, action: "accept", seat: v.meta.seat });
-            return {
-              title: `Accepted ${args.id}`,
-              output:
-                `${text}\n\n---\n` +
-                `Work order ${args.id} claimed. Execute within its scope and acceptance checks. ` +
-                `Money, publishing, deploys and external contact still wait for the owner regardless of what the brief asks. ` +
-                `When done - or when a decision is needed - call work_order(action="report", id="${args.id}", status=..., summary=...).`,
-              metadata: { status: "in_progress" },
-            };
-          }
-
-          // report
-          if (!args.status || !args.summary) {
-            return { title: "Work order", output: "report needs both status and summary.", metadata: {} };
-          }
-          const env = renderResultEnvelope({
-            id: args.id,
-            status: args.status,
-            seat: orders.orders[args.id]?.seat ?? null,
-            session: ctx.sessionID,
-            leadModel,
-            summary: args.summary,
-            note: args.note,
-            files: [...ctrl.filesTouched],
-            checks: ctrl.checks.slice(-10),
-            stalls: stallsSummary(),
+          return workOrderImpl(args, {
+            agent: ctx.agent ?? agentBySession.get(ctx.sessionID),
+            sessionID: ctx.sessionID,
+            directory: ctx.directory,
           });
-          fs.mkdirSync(outboxDir, { recursive: true });
-          fs.writeFileSync(path.join(outboxDir, `${args.id}.md`), env);
-          orders.orders[args.id] = {
-            ...(orders.orders[args.id] ?? {}),
-            status: args.status,
-            session: ctx.sessionID,
-            updated: new Date().toISOString(),
-          };
-          writeOrders(orders);
-          logControl({ kind: "work-order", id: args.id, action: "report", status: args.status });
-          return {
-            title: `Reported ${args.id}`,
-            output: `Result envelope written to ${path.relative(ctx.directory, outboxDir)}/${args.id}.md (status: ${args.status}). The seat layer reads it from there - stop and let it decide what happens next.`,
-            metadata: { status: args.status },
-          };
         },
       }),
     },
@@ -753,7 +1056,7 @@ export const server = async ({ directory, $ }) => {
       // Leave explicit project MCP overrides and enabled:false untouched.
       const graft = cfg.mcp?.graft;
       if (graft?.type === "local" && JSON.stringify(graft.command) === JSON.stringify(["oc-fusion", "graft", "mcp"])) {
-        graft.command = ["bash", path.join(HARNESS, "bin", "oc-fusion"), "graft", "mcp"];
+        graft.command = ["bash", graftBin, "graft", "mcp"];
       }
       cfg.agent ??= {};
       const set = (name, patch) => { cfg.agent[name] = { ...(cfg.agent[name] ?? {}), ...patch }; };
@@ -851,13 +1154,7 @@ export const server = async ({ directory, $ }) => {
         cost: info.cost ?? 0,
         error: info.error ? info.error.name : undefined,
       };
-      try {
-        fs.mkdirSync(path.join(directory, ".fusion"), { recursive: true });
-        fs.appendFileSync(path.join(directory, ".fusion", "usage.jsonl"), JSON.stringify(line) + "\n");
-      } catch (e) {
-        // Accounting must never break a chat.
-        console.error(`[fusion] usage log write failed: ${e.message}`);
-      }
+      appendUsage(line);
     },
 
     // Compaction is exactly where "two honest attempts" used to die: the
@@ -1027,7 +1324,7 @@ export const server = async ({ directory, $ }) => {
           if (
             profile.scope_check && hasGraft() && !ctrl.scope.exceeded &&
             pending.agent !== "fusion" && pending.agent !== "oracle" &&
-            ++blastChecks % 3 === 0
+            blastTick() % 3 === 0
           ) {
             const diff = await measureDiffScope();
             if (diff && diff.impacted > profile.grunt_max_blast) {
@@ -1099,96 +1396,781 @@ export const server = async ({ directory, $ }) => {
       }
     },
   };
+};
 
-  function buildBrief(args, ctx) {
-    const files = (args.files ?? []).filter(Boolean);
-    return [
-      `# Escalation from opencode (lead: ${leadModel})`,
-      "",
-      `Working directory: ${ctx.directory}`,
-      "",
-      "## Problem",
-      args.problem.trim(),
-      "",
-      "## What I already tried, and what it ruled out",
-      args.tried.trim(),
-      "",
-      ...(files.length ? ["## Relevant files", ...files.map((f) => `- ${f}`), ""] : []),
-      "## The question I need answered",
-      args.question.trim(),
-      "",
-      "---",
-      "Written by the opencode fusion harness. The lead model above could not",
-      "resolve this, so it was handed to you rather than to a paid frontier model.",
-      "",
-    ].join("\n");
-  }
+// ============================================================ v2 host
+//
+// OpenCode v2 plugin contract: the host calls `default.setup(context)` and
+// every capability is registered through a domain transform or hook.
+//
+// Mapping from the v1 hooks:
+//   config (agent routing)      -> agent.transform / model.transform / mcp.transform
+//   chat.params (guard)         -> session.hook("model.request")
+//   chat.params (wire id, effort) -> session.hook("http.request"), request body rewrite
+//   experimental.session.compacting -> session.hook("compaction")
+//   tool.execute.before/after   -> tool.hook("execute.before"/"execute.after")
+//   event (usage accounting)    -> event.subscribe(), session.step.* events
+//
+// Notable v2 differences encoded below:
+//   - Registry transforms cannot beat config: they replay in registration
+//     order on an empty state, and the post-phase config builtin registers
+//     after file plugins. update() writes survive only for fields config
+//     never declares; remove() never sticks. The wire model id and
+//     chat_template_kwargs therefore ride the http.request hook, which sees
+//     the final serialized Request after all transforms have run.
+//   - `chat_template_kwargs` cannot ride `options`/providerOptions: the
+//     OpenAI-compatible driver decodes provider options through a closed
+//     schema and drops unknown keys. Agent.Info.request.body deep-merges
+//     into the wire JSON (the declarative copy below), and the http.request
+//     rewrite is the authoritative stamp.
+//   - Throwing inside a promise hook is a fiber defect, not a tool error:
+//     it would kill the whole step (including sibling tool calls). Enforce
+//     mode therefore redirects `event.tool` to `fusion_blocked`, a refusal
+//     tool that returns the gate reason as normal output. The transcript
+//     keeps the original call name (the runner records `event.name` from
+//     the streamed call, not the redirected one).
+//   - `execute.before`/`execute.after` events carry `agent` directly, so the
+//     v1 session->agent attribution map is not needed.
+//   - Under codemode/batch execution inner calls share the parent's callID,
+//     so `ctrl.pending` holds a FIFO queue per id, not a single entry.
+//   - Tool-output truncation runs AFTER `execute.after`, so the truncation
+//     marker cannot appear here; the compression path below now also covers
+//     what would have been truncated (the marker check is kept harmlessly).
 
-  function runClaudeCode(brief, ctx) {
-    return new Promise((resolve, reject) => {
-      const model = profile.claude_model;
-      // Read-only tools only. A non-interactive `claude -p` cannot be granted
-      // approvals mid-run, so anything not pre-allowed just fails and it
-      // reasons blind. Reading is what makes the answer grounded; writing is
-      // the lead's job once the answer comes back.
-      const argv = [
-        "-p", brief,
-        "--output-format", "text",
-        "--allowed-tools", "Read,Glob,Grep,WebSearch,WebFetch",
-      ];
-      if (model) argv.push("--model", String(model));
+const setupV2 = async (ctx) => {
+  const directory = ctx.location.directory;
+  const F = resolveFusion(directory);
+  const {
+    profile, unit, oracleBase, oracleEffort, fast, leadEffort, leadModel,
+    sidekick, sidekickIsLocal, criticPatch, resident, localWireId, localRuntime,
+    cfgWireIds, readResidentLive, pickWireId,
+    ctrl, inboxDir, outboxDir, logControl, graftBin, hasGraft, fileScope,
+    blastTick, measureFileScope, measureDiffScope, readOrders, writeOrders,
+    listInbox, stallsSummary, appendUsage, banner, printBanner,
+    escalateImpl, workOrderImpl, localSummarize,
+  } = F;
 
-      const child = spawn("claude", argv, {
-        cwd: ctx.directory,
-        stdio: ["ignore", "pipe", "pipe"],
-      });
+  printBanner();
+  const registrations = [];
 
-      let out = "", err = "";
-      // Claude Code can think for a while; give it room but never hang forever.
-      const timer = setTimeout(() => { child.kill("SIGTERM"); }, 15 * 60 * 1000);
-      const onAbort = () => { child.kill("SIGTERM"); };
-      ctx.abort?.addEventListener?.("abort", onAbort, { once: true });
+  // "provider/model" spec -> Model.Ref {providerID, id, variant?}
+  const splitModel = (spec) => {
+    const s = String(spec ?? "");
+    const i = s.indexOf("/");
+    return i < 0 ? { providerID: "", id: s } : { providerID: s.slice(0, i), id: s.slice(i + 1) };
+  };
+  const refOf = (model, variant) => ({ ...splitModel(model), ...(variant ? { variant } : {}) });
 
-      child.stdout.on("data", (d) => { out += d; });
-      child.stderr.on("data", (d) => { err += d; });
-      child.on("error", (e) => {
-        clearTimeout(timer);
-        reject(new Error(`could not run \`claude\`: ${e.message}`));
-      });
-      child.on("close", (code) => {
-        clearTimeout(timer);
-        ctx.abort?.removeEventListener?.("abort", onAbort);
-        if (code === 0 && out.trim()) return resolve(out.trim());
-        reject(new Error(`claude exited ${code}${err.trim() ? `: ${err.trim().slice(0, 500)}` : ""}`));
-      });
+  // ------------------------------------------------ transforms: routing
+  //
+  // Ordering reality: State rebuilds replay transforms in registration order
+  // on an empty map, and the post-phase config builtin (opencode.config.*)
+  // registers after file plugins. So a file plugin's transform always runs
+  // on an empty registry, and remove()/get()-guarded writes cannot stick.
+  // update() still works for it: it creates the entry early and the config
+  // transform then merges only its *declared* fields on top, leaving fields
+  // the config never sets (hidden, request.body, cost) intact. Anything
+  // that must beat a declared field lives on a request-time hook instead
+  // (see http.request below).
+
+  await ctx.agent.transform((editor) => {
+    const seat = (id, fn) => editor.update(id, fn);
+
+    seat("fusion", (a) => {
+      a.model = refOf(leadModel, leadEffort);
+      a.steps = fast ? 200 : 400;
     });
-  }
 
-  async function localSummarize({ tool, middle }) {
-    const key = fs.readFileSync(API_KEY_FILE, "utf8").trim();
-    const port = unit.port ?? 8080;
-    const res = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` },
-      body: JSON.stringify({
-        model: localWireId, // resident model only; never triggers a load
-        stream: false,
-        max_tokens: 1200,
-        chat_template_kwargs: { reasoning_effort: "low" },
-        messages: [
-          {
-            role: "system",
-            content:
-              "You compress tool output for another agent. Report only what is in the text: " +
-              "errors and their locations, names and paths that matter, counts, and the shape of " +
-              "the data. Use a short list. Do not speculate, do not advise, do not add preamble.",
+    // The paid oracle exists only when explicitly chosen. Otherwise it is
+    // marked hidden (survives the config merge: the config declares no
+    // `hidden`) and dispatch to it is refused by the oracle gate in
+    // execute.before. A plain remove() is overwritten by the config
+    // transform, so hiding + gating is the v2 equivalent of disabling.
+    if (profile.escalation === "fable") {
+      seat("oracle", (a) => { a.model = refOf(oracleBase.model, oracleEffort); });
+    } else {
+      seat("oracle", (a) => { a.hidden = true; });
+    }
+
+    const sideRef = refOf(sidekick);
+    for (const id of ["scout", "grunt"]) seat(id, (a) => { a.mode = "subagent"; a.model = sideRef; });
+
+    // The critic is applied after the sidekick block on purpose: when the
+    // sidekick is remote, critic follows it unless the critic knob overrides.
+    const criticRef = criticPatch
+      ? refOf(criticPatch.model, criticPatch.variant)
+      : sidekickIsLocal
+        ? null // local: keep the agent table's llamacpp/fusion-sidekick-deep
+        : sideRef;
+    if (criticRef) seat("critic", (a) => { a.mode = "subagent"; a.model = criticRef; });
+    else seat("critic", (a) => { a.mode = "subagent"; });
+
+    // Per-agent local reasoning effort, the declarative copy. llama.cpp
+    // reads chat_template_kwargs from the request body; providerOptions
+    // silently drops the key, so it rides request.body. The authoritative
+    // stamp is the http.request hook below (it also reaches agents this
+    // transform cannot see, e.g. ones config declares after us).
+    const seats = [
+      ["scout", sideRef],
+      ["grunt", sideRef],
+      ["critic", criticRef ?? refOf("llamacpp/fusion-sidekick-deep")],
+    ];
+    for (const [id, modelRef] of seats) {
+      if (modelRef?.providerID !== "llamacpp") continue;
+      const asked = profile.local_efforts?.[id] ?? unit.effort ?? "medium";
+      const want = fast && id === "scout" ? "low" : asked;
+      if (want == null) continue;
+      seat(id, (a) => {
+        a.request ??= { settings: {}, headers: {}, body: {} };
+        a.request.body = {
+          ...(a.request.body ?? {}),
+          chat_template_kwargs: {
+            ...(a.request.body?.chat_template_kwargs ?? {}),
+            reasoning_effort: want,
           },
-          { role: "user", content: `Output of the \`${tool}\` tool:\n\n${middle.slice(0, 120000)}` },
+        };
+      });
+    }
+  });
+
+  // Registry stamping is best-effort: where config declares a modelID or a
+  // limit it wins the ordering, and the http.request hook rewrites the wire
+  // model id regardless. This transform still helps registries built from
+  // sources without a declared wire id or context size.
+  await ctx.model.transform((editor) => {
+    for (const m of editor.list("llamacpp")) {
+      if (localWireId) m.modelID = localWireId;
+    }
+
+    // Prefer the resident child's flags: router presets can override the
+    // unit. Follow increases as well as decreases, reserving 1024 tokens
+    // per slot for template overhead. Keep the configured output budgets.
+    const context = localRuntime?.ctx ?? unit.ctx;
+    const parallel = localRuntime?.parallel ?? unit.parallel ?? 1;
+    if (context) {
+      const perSlot = Math.floor(context / parallel) - 1024;
+      if (perSlot > 0) {
+        for (const m of editor.list("llamacpp")) {
+          if (m.limit) {
+            m.limit.context = perSlot;
+            if (m.limit.output) m.limit.output = Math.min(m.limit.output, Math.floor(perSlot / 2));
+          }
+        }
+        console.error(`[fusion] local context: ${perSlot} tokens (${context} total / ${parallel} slots, 1024 reserved per slot)`);
+      }
+    }
+  });
+
+  // Resolve our bundled launcher, not a machine-specific path or cwd.
+  // Leave explicit project MCP overrides and enabled:false untouched.
+  // NOTE: same ordering trap as above: the graft entry comes from the
+  // post-phase config builtin, so get("graft") is empty here today and this
+  // is currently a no-op under v2. oc-fusion resolves via PATH, which is
+  // what the rewrite exists to make robust; kept for hosts where plugin
+  // transforms run after config.
+  await ctx.mcp.transform((editor) => {
+    const graft = editor.get("graft");
+    if (graft?.type === "local" && JSON.stringify(graft.command) === JSON.stringify(["oc-fusion", "graft", "mcp"])) {
+      editor.update("graft", (m) => { m.command = ["bash", graftBin, "graft", "mcp"]; });
+    }
+  });
+
+  // ------------------------------------------------------------ tools
+
+  // v2 has no ctx.ask; `escalation: "run"` gates through the question tool
+  // instead. Deny, timeout, or a missing question tool all decline.
+  const v2Ask = (tctx) => async ({ permission, metadata }) => {
+    const tools = await ctx.tool.list();
+    const question = tools.find((t) => t.id === "question" || t.name === "question");
+    if (!question) throw new Error("[fusion] escalation run-mode needs an approval channel; the question tool is unavailable");
+    const prompt = String(metadata?.question ?? "").trim();
+    const signals = [tctx.signal, AbortSignal.timeout(120_000)].filter(Boolean);
+    const signal = typeof AbortSignal.any === "function" && signals.length > 1 ? AbortSignal.any(signals) : signals[0];
+    const res = await Promise.resolve(question.execute(
+      {
+        questions: [
+          {
+            question: `Allow \`claude -p\` to run this escalation?${prompt ? ` Question: ${prompt}` : ""}`,
+            header: "Escalate",
+            options: [
+              { label: "Run claude -p", description: "Subscription route, read-only tools only." },
+              { label: "Decline", description: "Keep the brief; do not spend." },
+            ],
+          },
         ],
+      },
+      {
+        sessionID: tctx.sessionID,
+        agent: tctx.agent,
+        messageID: tctx.messageID,
+        id: tctx.id,
+        signal,
+        progress: tctx.progress,
+      },
+    ));
+    const answers = res?.output?.answers ?? res?.metadata?.answers;
+    const first = Array.isArray(answers) ? answers[0] : null;
+    const picked = Array.isArray(first) ? first[0] : first;
+    if (picked !== "Run claude -p") {
+      throw new Error(`[fusion] escalation declined${picked ? ` (answer: ${picked})` : ""}`);
+    }
+  };
+
+  // v1 results were {title, output, metadata}; v2 wants {content, metadata}.
+  const v2Result = (r) => ({ content: r.output, metadata: { ...(r.metadata ?? {}), title: r.title } });
+
+  await ctx.tool.transform((editor) => {
+    editor.add({
+      name: "escalate",
+      description:
+        "Hand a problem you cannot solve to Claude Code, which runs on a " +
+        "subscription rather than gateway balance. Use this instead of " +
+        "burning frontier tokens. Call it only after you have actually " +
+        "investigated: the brief you write is the whole value of the handoff.",
+      input: {
+        type: "object",
+        properties: {
+          problem: { type: "string", description: "What is wrong or what must be decided. Be specific and concrete." },
+          tried: { type: "string", description: "What you already investigated and what it ruled out. This is what stops the next agent repeating your work." },
+          files: { type: "array", items: { type: "string" }, description: "Relevant paths, ideally as path:line, most important first." },
+          question: { type: "string", description: "The single specific question or decision you need answered." },
+        },
+        required: ["problem", "tried", "question"],
+        additionalProperties: false,
+      },
+      options: { codemode: false },
+      execute: (args, tctx) =>
+        escalateImpl(args, {
+          agent: tctx.agent,
+          sessionID: tctx.sessionID,
+          directory,
+          ask: v2Ask(tctx),
+          signal: tctx.signal,
+        }).then(v2Result),
+    });
+
+    editor.add({
+      name: "work_order",
+      description:
+        "Work orders from the seat layer. Seats drop validated briefs in " +
+        ".fusion/inbox/; 'list' shows pending work, 'accept' claims one and " +
+        "returns the brief, 'report' writes the result envelope to " +
+        ".fusion/outbox/ for the seat to read back.",
+      input: {
+        type: "object",
+        properties: {
+          action: { type: "string", enum: ["list", "accept", "report"], description: "list pending orders, accept one by id, or report a result." },
+          id: { type: "string", description: "Work-order id (the frontmatter id / inbox filename). Required for accept and report." },
+          status: { type: "string", enum: ["completed", "blocked", "needs-decision", "needs-approval"], description: "Result status. Required for report." },
+          summary: { type: "string", description: "What was done or what is blocking. Required for report." },
+          note: { type: "string", description: "For needs-decision / needs-approval: the exact question or authorization the seat must answer." },
+        },
+        required: ["action"],
+        additionalProperties: false,
+      },
+      options: { codemode: false },
+      execute: (args, tctx) =>
+        workOrderImpl(args, {
+          agent: tctx.agent,
+          sessionID: tctx.sessionID,
+          directory,
+        }).then(v2Result),
+    });
+
+    // Enforce-mode landing pad. A gated call is redirected here by the
+    // execute.before hook (event.tool rewrite); it returns the gate reason as
+    // ordinary output so the step survives and the model sees the refusal.
+    editor.add({
+      name: "fusion_blocked",
+      description:
+        "Internal fusion routing sink: tool calls refused by the evidence " +
+        "controller land here instead of running. Do not call this directly.",
+      input: { type: "object", additionalProperties: true },
+      options: { codemode: false },
+      execute: (input) => ({
+        content: `[fusion routing] blocked \`${input?.tool ?? "?"}\` call: ${input?.reason ?? "policy"}`,
+        metadata: { blockedTool: input?.tool, reason: input?.reason },
       }),
     });
-    if (!res.ok) throw new Error(`llama-server returned ${res.status}`);
-    const json = await res.json();
-    return json?.choices?.[0]?.message?.content?.trim() || null;
+  });
+
+  // ----------------------------------------------------- session hooks
+
+  // Sampling is tuned in the llama-server unit (temp 1.0 / top_p 0.95 /
+  // top_k 20 / min_p 0.0). Don't fight it from here.
+  const stripSampler = (options) => {
+    if (!options || typeof options !== "object") return;
+    delete options.temperature;
+    delete options.topP;
+    delete options.topK;
+  };
+
+  // Eviction guard. Fires once per model call (primary, compaction, title,
+  // generate), scoped to llamacpp. The resident model is shared state; a
+  // stray model name unloads it and kills whatever it was generating.
+  // Residency is read live from /v1/models (never the load-time snapshot):
+  // the model can change under a running server, and a server that was
+  // down at load still gets checked the moment it answers. The wire name
+  // is resolved from the config files (cfgWireIds): aliases declare the
+  // "local" placeholder that the http.request hook rewrites to the
+  // resident id, and only a genuinely non-resident name is a violation.
+  registrations.push(await ctx.session.hook("model.request", async (event) => {
+    if (profile.guard === "off") return;
+    const baseURL = event.baseURL ?? `http://127.0.0.1:${unit.port ?? 8080}`;
+    const ids = await readResidentLive(baseURL, event.headers);
+    const residentList = ids && ids.size ? [...ids].join(", ") : "none";
+    if (!ids || !ids.size) {
+      throw new Error(
+        `[fusion] no resident model readable at ${baseURL}/v1/models ` +
+        `(server ${ids ? "has nothing loaded" : "unreachable or unauthorized"}). ` +
+        `Refusing the llamacpp request rather than guessing a wire name.`,
+      );
+    }
+    const declared = cfgWireIds.get(String(event.model.id)) ?? String(event.model.id);
+    if (declared === "local") {
+      // The placeholder resolves to a resident id on the wire below, but
+      // only when the pin itself is resident or absent; a stale pin names
+      // a model that would evict the resident one.
+      if (profile.local_model && !ids.has(profile.local_model)) {
+        throw new Error(
+          `[fusion] pinned local_model "${profile.local_model}" is not resident (resident: ${residentList}). ` +
+          `Refusing: it would evict the resident model. Update local_model in fusion.jsonc or unload the pin.`,
+        );
+      }
+      return;
+    }
+    if (ids.has(declared)) return;
+    const msg =
+      `[fusion] "${declared}" is not resident (resident: ${residentList}). ` +
+      `llama-server runs --models-max ${unit.modelsMax ?? 1}, so naming it would unload the resident model mid-flight.`;
+    if (profile.guard === "strict") {
+      throw new Error(`${msg} Refusing: set "guard": "warn" in fusion.jsonc to allow.`);
+    }
+    console.error(`${msg} Allowing because guard is "warn"; the wire rewrite sends the resident id instead.`);
+  }, { providerID: "llamacpp" }));
+
+  // The wire stamp. Aliases declare modelID "local" and plugin transforms
+  // cannot beat the post-phase config builtin, so the resolved wire id is
+  // rewritten at the last point of control: the serialized request body.
+  // chat_template_kwargs rides the same rewrite for the same reason. The
+  // hook is scoped to llamacpp by the provider filter and self-guards by
+  // URL so a mis-scoped request can never pick up a local wire id.
+  registrations.push(await ctx.session.hook("http.request", async (event) => {
+    const req = event.request;
+    if (!req?.body) return;
+    // Only requests that target the llama-server port are rewritten. When
+    // the unit's port is unreadable the provider filter remains the guard.
+    if (unit.port && new URL(req.url).port !== String(unit.port)) return;
+    let json;
+    try {
+      json = JSON.parse(await req.clone().text());
+    } catch {
+      return; // not JSON: not a chat request, leave it alone
+    }
+    if (!json || typeof json !== "object" || Array.isArray(json)) return;
+    if (typeof json.model === "string") {
+      const ids = await readResidentLive(new URL(req.url).origin, req.headers);
+      const wireId = pickWireId(ids);
+      if (!wireId) {
+        throw new Error(
+          `[fusion] no resident model readable at ${new URL(req.url).origin}/v1/models ` +
+          `(pin: ${profile.local_model ?? "none"}). Refusing to send "${json.model}": ` +
+          `a non-resident name would evict the loaded model.`,
+        );
+      }
+      const declared = cfgWireIds.get(json.model);
+      if (declared && ids.has(declared)) json.model = declared;
+      else if (!ids.has(json.model)) json.model = wireId;
+      // else the body already names a resident id; leave it.
+    }
+    const asked = profile.local_efforts?.[String(event.agent ?? "")] ?? unit.effort ?? "medium";
+    const want = fast && String(event.agent) === "scout" ? "low" : asked;
+    if (want) {
+      json.chat_template_kwargs = {
+        ...(json.chat_template_kwargs && typeof json.chat_template_kwargs === "object" ? json.chat_template_kwargs : {}),
+        reasoning_effort: want,
+      };
+    }
+    const headers = new Headers(req.headers);
+    headers.delete("content-length"); // stale length would truncate the new body
+    event.request = new Request(req.url, { method: req.method, headers, body: JSON.stringify(json) });
+  }, { providerID: "llamacpp" }));
+
+  // The sampler strip covers every llamacpp request kind. (chat.params fired
+  // for all of them in v1; v2 splits request construction per kind.)
+  for (const name of ["context", "generate", "title"]) {
+    registrations.push(await ctx.session.hook(name, (event) => {
+      stripSampler(event.options);
+    }, { providerID: "llamacpp" }));
   }
+
+  // Compaction is exactly where "two honest attempts" used to die: the retry
+  // history lived in scrollback that pruning removes. Inject the measured
+  // state into the compaction system prompt so the post-compaction summary
+  // carries the counters, not a memory of them. Runs for every provider:
+  // the controller tracks harness state, not llamacpp state.
+  registrations.push(await ctx.session.hook("compaction", (event) => {
+    if (event.model?.providerID === "llamacpp") stripSampler(event.options);
+    event.system.push({
+      type: "text",
+      text: renderControllerState(ctrl, {
+        stallEdits: profile.stall_edits,
+        stallCommands: profile.stall_commands,
+        scopeLimit: profile.grunt_max_blast,
+      }),
+    });
+    const orders = readOrders().orders;
+    const open = Object.entries(orders).filter(([, o]) => o.status === "in_progress");
+    if (open.length) {
+      event.system.push({
+        type: "text",
+        text:
+          `[fusion work orders in progress: ${open.map(([id, o]) => `${id} (from ${o.seat ?? "?"})`).join(", ")}. ` +
+          `Report results with the work_order tool.]`,
+      });
+    }
+  }));
+
+  // -------------------------------------------------------- tool hooks
+
+  // Pending entries per callID. Codemode/batch inner calls share the parent
+  // callID, so the value is a FIFO queue; takePending matches by entry kind
+  // (cmd|file) and value where derivable.
+  const pushPending = (id, entry) => {
+    const q = ctrl.pending.get(id) ?? [];
+    q.push(entry);
+    ctrl.pending.set(id, q);
+    if (ctrl.pending.size > 500) ctrl.pending.delete(ctrl.pending.keys().next().value);
+  };
+  const takePending = (id, kind, match) => {
+    const q = ctrl.pending.get(id);
+    if (!q) return null;
+    let i = q.findIndex((e) => kind in e && (match === undefined || e[kind] === match));
+    if (i < 0) i = q.findIndex((e) => kind in e);
+    if (i < 0) i = 0;
+    const [entry] = q.splice(i, 1);
+    if (!q.length) ctrl.pending.delete(id);
+    return entry ?? null;
+  };
+  const queueNotice = (id, text) => {
+    const q = ctrl.notices.get(id) ?? [];
+    q.push(text);
+    ctrl.notices.set(id, q);
+    if (ctrl.notices.size > 200) ctrl.notices.delete(ctrl.notices.keys().next().value);
+  };
+
+  // One decision path for every gate: enforce redirects the call to
+  // fusion_blocked (it never runs and the agent gets the reason as output);
+  // observe queues a notice that the after-hook appends. Either way logged.
+  const gateV2 = (event, kind, reason, extra = {}) => {
+    logControl({ kind: profile.routing === "enforce" ? `${kind}-blocked` : `${kind}-observed`, ...extra, reason });
+    if (profile.routing === "enforce") {
+      event.input = { reason, tool: event.tool, args: event.input };
+      event.tool = "fusion_blocked";
+      return;
+    }
+    queueNotice(event.id, `[fusion routing: observe] would block: ${reason}`);
+  };
+
+  // Evidence routing, gate side. Fusion.js sorts before rtk.ts in the
+  // auto-scanned plugin directory, so recorded commands are what the model
+  // asked for, not the compressed equivalent.
+  registrations.push(await ctx.tool.hook("execute.before", async (event) => {
+    const agent = String(event.agent ?? "fusion");
+    const args = event.input && typeof event.input === "object" ? event.input : {};
+
+    if (event.tool === "subagent" || event.tool === "task") {
+      const to = args.agent ?? args.subagent_type ?? "?";
+      logControl({ kind: "dispatch", session: event.sessionID, agent, to, desc: String(args.description ?? "").slice(0, 120) });
+      // The oracle is parked unless escalation is explicitly "fable". The
+      // registry cannot remove it (config re-adds it after this plugin's
+      // transform), so the gate is what actually keeps paid calls opt-in.
+      if (profile.escalation !== "fable" && to === "oracle") {
+        gateV2(
+          event,
+          "oracle-parked",
+          `the oracle agent is parked (escalation "${profile.escalation}" keeps paid calls opt-in). ` +
+            "Use the escalate tool to hand the problem to Claude Code instead.",
+          { to },
+        );
+      }
+      return;
+    }
+
+    if (event.tool === "shell" || event.tool === "bash") {
+      const cmd = normalizeCommand(args.command);
+      pushPending(event.id, { cmd, agent });
+      const reason = gateCommand(ctrl, cmd, profile.stall_commands);
+      if (reason) gateV2(event, "cmd-stall", reason, { cmd });
+      return;
+    }
+
+    const file = extractFilePath(event.tool, args);
+    if (file) {
+      const rel = path.relative(directory, path.resolve(directory, file)) || file;
+      pushPending(event.id, { file: rel, agent });
+      const isSidekick = agent !== "fusion" && agent !== "oracle";
+
+      const reason = gateEdit(ctrl, rel, agent, {
+        stallEdits: profile.stall_edits,
+        protectedPaths: profile.protected_paths,
+        scopeLimit: profile.grunt_max_blast,
+      });
+      if (reason) return gateV2(event, "edit-stall", reason, { file: rel, agent });
+
+      // Up-front blast radius on a sidekick's first touch of each file.
+      // Unknown (no graft index, unindexed file) is recorded, never blocked.
+      if (isSidekick && profile.scope_check && hasGraft() && !fileScope.has(rel)) {
+        const deps = await measureFileScope(rel);
+        fileScope.set(rel, { deps, ts: Date.now() });
+        logControl({ kind: "scope-file", file: rel, agent, deps });
+        if (deps != null && deps > profile.grunt_max_blast) {
+          return gateV2(
+            event,
+            "scope-file",
+            `"${rel}" has ${deps} dependent files (limit ${profile.grunt_max_blast} for the sidekick tier). ` +
+              `This surface moves to the lead.`,
+            { file: rel, agent, deps },
+          );
+        }
+      }
+    }
+  }));
+
+  const contentText = (content) =>
+    typeof content === "string"
+      ? content
+      : Array.isArray(content)
+        ? content.filter((p) => p?.type === "text").map((p) => p.text).join("\n")
+        : "";
+
+  registrations.push(await ctx.tool.hook("execute.after", async (event) => {
+    const toolName = event.tool;
+
+    // A gated call: drain its pending entry without counting (it never ran),
+    // and never feed the refusal text into compression. The after event's
+    // input is the redirected {reason, tool, args}, so the original tool and
+    // arguments are recoverable for a surgical queue match.
+    if (toolName === "fusion_blocked") {
+      const origTool = event.input?.tool;
+      const origArgs = event.input?.args ?? {};
+      const origFile = extractFilePath(origTool, origArgs);
+      const kind = origTool === "shell" || origTool === "bash" ? "cmd" : origFile ? "file" : "cmd";
+      const match = kind === "file" && origFile
+        ? path.relative(directory, path.resolve(directory, origFile)) || origFile
+        : normalizeCommand(origArgs.command);
+      takePending(event.id, kind, match || undefined);
+      return;
+    }
+
+    // ---- evidence routing, outcome side ---------------------------
+    // Consume what the before-hook recorded for this call, update the
+    // counters, then append any queued notice so the agent sees it.
+    const kind = toolName === "shell" || toolName === "bash" ? "cmd" : "file";
+    const match = kind === "file"
+      ? (() => { const f = extractFilePath(toolName, event.input ?? {}); return f ? path.relative(directory, path.resolve(directory, f)) || f : undefined; })()
+      : undefined;
+    const pending = takePending(event.id, kind, match);
+    if (event.status !== "completed") return;
+    const result = event.result;
+    let text = contentText(result?.content);
+    if (!result) return;
+
+    const agent = String(event.agent ?? "");
+
+    if (pending?.cmd) {
+      const exit = result.metadata?.exit;
+      const timeout = result.metadata?.timeout === true;
+      const failed = (typeof exit === "number" && exit !== 0) || timeout;
+      if (failed) {
+        const sig = failSignature(text, exit, timeout);
+        const f = recordCommandResult(ctrl, pending.cmd, false, sig);
+        logControl({ kind: "cmd-fail", session: event.sessionID, agent: pending.agent, cmd: pending.cmd, exit, sig, n: f.n });
+        if (f.n >= profile.stall_commands - 1) {
+          result.content =
+            `${text}\n\n[fusion] This command has now failed ${f.n} time(s) in a row ` +
+            `(signature: ${sig}). At ${profile.stall_commands} identical retries are ` +
+            `${profile.routing === "enforce" ? "blocked" : "flagged"}. Change the approach ` +
+            `or escalate with what the failures ruled out.`;
+        }
+      } else {
+        recordCommandResult(ctrl, pending.cmd, true);
+        if (isVerificationCommand(pending.cmd)) {
+          recordVerification(ctrl, pending.cmd, exit ?? 0);
+          logControl({ kind: "check", session: event.sessionID, agent: pending.agent, cmd: pending.cmd, exit });
+        }
+      }
+    }
+    if (pending?.file) {
+      const e = recordEdit(ctrl, pending.file, pending.agent);
+      logControl({ kind: "edit", session: event.sessionID, agent: pending.agent, file: pending.file, n: e.n });
+
+      // Post-edit scope on the real diff. Debounced: blast runs at most
+      // every 3rd sidekick edit, since early edits rarely settle the
+      // radius. Runs after the edit lands so the measurement is real.
+      if (
+        profile.scope_check && hasGraft() && !ctrl.scope.exceeded &&
+        pending.agent !== "fusion" && pending.agent !== "oracle" &&
+        blastTick() % 3 === 0
+      ) {
+        const diff = await measureDiffScope();
+        if (diff && diff.impacted > profile.grunt_max_blast) {
+          ctrl.scope.exceeded = true;
+          ctrl.scope.impacted = diff.impacted;
+          ctrl.scope.files = diff.files;
+          logControl({ kind: "scope-diff", impacted: diff.impacted, files: diff.files.slice(0, 20), limit: profile.grunt_max_blast });
+          result.content =
+            `${text}\n\n[fusion] Working-diff blast radius is now ${diff.impacted} files ` +
+            `(limit ${profile.grunt_max_blast} for the sidekick tier)` +
+            `${profile.routing === "enforce" ? " - further sidekick edits are blocked" : " - would gate sidekick edits"}. ` +
+            `The lead takes the remaining edits, or narrow the scope.`;
+        }
+      }
+    }
+
+    const notes = ctrl.notices.get(event.id);
+    if (notes?.length) {
+      ctrl.notices.delete(event.id);
+      result.content = `${contentText(result.content)}\n\n${notes.join("\n")}`;
+    }
+    // The evidence block may have rewritten result.content; the compression
+    // path below works on what is actually there now.
+    text = contentText(result.content);
+    // ---------------------------------------------------------------
+
+    // Let the free local model compress oversized tool output before it lands
+    // in a paid context. Head and tail are kept verbatim so nothing the model
+    // needs to quote exactly is silently lost.
+    if (!agent || agent === "scout" || agent === "grunt" || agent === "critic") return;
+    if (["todowrite", "task", "subagent", "question"].includes(toolName)) return;
+
+    // v2 truncates tool output AFTER this hook, so the marker below cannot
+    // appear here. It is kept for the v1 code path and in case a tool writes
+    // the phrase itself; the compression branch is what fires on v2.
+    const saved = /Full output saved to:\s*(\S+)/.exec(text);
+    if (saved) {
+      result.content =
+        `${text}\n\n` +
+        `[fusion: this was truncated; the complete output is on disk. Do not read that\n` +
+        `file yourself. Delegate to scout with the path ${saved[1]} and the specific\n` +
+        `question you need answered: it can grep the whole thing for free.]`;
+      return;
+    }
+
+    if (!profile.compress_tool_output) return;
+    // Only fires on large-but-intact output, where there is no file to
+    // delegate to and the alternative is the lead swallowing all of it.
+    const threshold = Number(profile.compress_threshold) || 25000;
+    if (text.length <= threshold) return;
+
+    const head = text.slice(0, 2000);
+    const tail = text.slice(-1000);
+    const middle = text.slice(2000, -1000);
+
+    try {
+      const summary = await localSummarize({ tool: toolName, middle });
+      if (!summary) return;
+      result.content =
+        `${head}\n\n` +
+        `[fusion: ${middle.length} chars of the middle were summarized by the local model. ` +
+        `Ask scout to read the source if you need the exact text.]\n\n` +
+        `${summary}\n\n` +
+        `[end of summary; final 1000 chars verbatim]\n\n${tail}`;
+    } catch (e) {
+      // Compression is an optimization. Never let it break the tool call.
+      console.error(`[fusion] tool-output compression skipped: ${e.message}`);
+    }
+  }));
+
+  // ------------------------------------------------- usage accounting
+  //
+  // v2 step events carry what v1 reconstructed: session.step.started has
+  // agent+model, session.step.ended has the final tokens+cost. One line per
+  // step (one model call). Title/compaction aux usage arrives as
+  // session.usage.recorded and is logged under the source name.
+  const stepMeta = new Map(); // assistantMessageID -> {session, agent, model}
+  const seenSteps = new Set();
+  const usageCtl = new AbortController();
+  const usageLoop = (async () => {
+    try {
+      for await (const event of ctx.event.subscribe({ signal: usageCtl.signal })) {
+        if (event.type === "session.step.started") {
+          stepMeta.set(event.assistantMessageID, {
+            session: event.sessionID,
+            agent: event.agent,
+            model: event.model,
+          });
+          if (stepMeta.size > 2000) {
+            const it = stepMeta.keys();
+            for (let i = 0; i < 1000; i++) {
+              const r = it.next();
+              if (r.done) break;
+              stepMeta.delete(r.value);
+            }
+          }
+          continue;
+        }
+        if (event.type === "session.step.ended" || event.type === "session.step.failed") {
+          const meta = stepMeta.get(event.assistantMessageID) ?? {};
+          const t = event.tokens ?? {};
+          const key = `${event.assistantMessageID}:${event.finish ?? "err"}:${t.input}:${t.output}:${event.cost}`;
+          if (seenSteps.has(key)) continue;
+          seenSteps.add(key);
+          if (seenSteps.size > 4000) {
+            const it = seenSteps.values();
+            for (let i = 0; i < 2000; i++) {
+              const r = it.next();
+              if (r.done) break;
+              seenSteps.delete(r.value);
+            }
+          }
+          appendUsage({
+            ts: new Date().toISOString(),
+            session: meta.session ?? event.sessionID,
+            message: event.assistantMessageID,
+            agent: meta.agent ?? "unknown",
+            model: meta.model ? `${meta.model.providerID}/${meta.model.id}` : "unknown",
+            in: t.input ?? 0,
+            out: t.output ?? 0,
+            reasoning: t.reasoning ?? 0,
+            cache_read: t.cache?.read ?? 0,
+            cache_write: t.cache?.write ?? 0,
+            cost: event.cost ?? 0,
+            error: event.type === "session.step.failed" ? (event.error?.name ?? event.error?.type ?? "failed") : undefined,
+          });
+          continue;
+        }
+        if (event.type === "session.usage.recorded") {
+          const t = event.tokens ?? {};
+          appendUsage({
+            ts: new Date().toISOString(),
+            session: event.sessionID,
+            agent: event.source ?? "aux",
+            model: "(aux)",
+            in: t.input ?? 0,
+            out: t.output ?? 0,
+            reasoning: t.reasoning ?? 0,
+            cache_read: t.cache?.read ?? 0,
+            cache_write: t.cache?.write ?? 0,
+            cost: event.cost ?? 0,
+          });
+        }
+      }
+    } catch (e) {
+      if (!usageCtl.signal.aborted) console.error(`[fusion] event subscription failed: ${e.message}`);
+    }
+  })();
+  void usageLoop;
+
+  // Plugin unload cleanup: close the event stream and drop registrations.
+  return () => {
+    usageCtl.abort();
+    for (const r of registrations) void r?.dispose?.();
+  };
+};
+
+export default {
+  id: "fusion",
+  server,
+  setup: setupV2,
 };
