@@ -37,10 +37,15 @@ fs.writeFileSync(
   ].join("\n"),
 );
 fs.writeFileSync(path.join(ROOT, "api-key"), "test-key\n");
+// Strata's key file, with a comment line first: only the first usable line
+// may reach the Authorization header. The URL is a port nothing listens on.
+fs.writeFileSync(path.join(ROOT, "strata-key"), "# strata\n-strata-test-key\n");
 
 process.env.PATH = `${BIN}:${process.env.PATH}`;
 process.env.FUSION_UNIT = path.join(ROOT, "llama-server.service");
 process.env.FUSION_API_KEY_FILE = path.join(ROOT, "api-key");
+process.env.FUSION_STRATA_URL = "http://127.0.0.1:18082";
+process.env.FUSION_STRATA_KEY_FILE = path.join(ROOT, "strata-key");
 
 const fusion = (await import("../.opencode/plugin/fusion.js")).default;
 
@@ -84,12 +89,14 @@ function fakeCtx(dir, seed = {}) {
     compaction: { id: "compaction", mode: "subagent", permissions: [] },
     summary: { id: "summary", mode: "subagent", permissions: [] },
   };
+  // Like opencode.jsonc, the sidekick seats declare no model: the plugin
+  // routes them (see "sidekick routing" below, which reads the real file).
   const cfgAgents = seed.cfgAgents ?? {
     fusion: { model: { providerID: "merge-gateway", id: "zai/glm-5.3", variant: "high" }, mode: "primary", steps: 400 },
-    scout: { model: { providerID: "llamacpp", id: "fusion-sidekick" }, mode: "subagent", steps: 60 },
-    grunt: { model: { providerID: "llamacpp", id: "fusion-sidekick" }, mode: "subagent", steps: 80 },
+    scout: { mode: "subagent", steps: 60 },
+    grunt: { mode: "subagent", steps: 80 },
     oracle: { model: { providerID: "merge-gateway", id: "anthropic/claude-fable-5-1", variant: "max" }, mode: "subagent", steps: 40 },
-    critic: { model: { providerID: "llamacpp", id: "fusion-sidekick-deep" }, mode: "subagent", steps: 40 },
+    critic: { mode: "subagent", steps: 40 },
     title: { model: { providerID: "merge-gateway", id: "zai/glm-5.3-flash" }, mode: "primary" },
   };
   const cfgModels = seed.cfgModels ?? {
@@ -249,6 +256,13 @@ function fakeCtx(dir, seed = {}) {
         await cb(event);
       }
     },
+    // The hooks registered for one provider, called raw: as if the host's
+    // provider filter had let a foreign request through.
+    fireRegisteredFor: async (name, providerID, event) => {
+      for (const { cb, opts } of hooks.get(name) ?? []) {
+        if (opts?.providerID === providerID) await cb(event);
+      }
+    },
   };
 }
 
@@ -287,7 +301,7 @@ test.afterEach(() => { globalThis.fetch = realFetch; });
 // ----------------------------------------------------------- setup shape
 
 test("v2 setup: transform ordering, oracle hidden, tools, hooks", async () => {
-  const dir = makeDir({}, defaultOpencodeCfg);
+  const dir = makeDir({ sidekick: "local", critic: "local" }, defaultOpencodeCfg);
   const h = fakeCtx(dir, {
     cfgMcps: { graft: { type: "local", command: ["oc-fusion", "graft", "mcp"] } },
   });
@@ -328,15 +342,133 @@ test("v2 setup: transform ordering, oracle hidden, tools, hooks", async () => {
     assert.equal(h.tools.get(name).options.codemode, false);
   }
 
-  // All the hooks the v1 plugin relied on have v2 homes.
-  assert.ok(h.hooks.get("session:model.request")?.length === 1);
-  assert.ok(h.hooks.get("session:http.request")?.length === 1);
-  assert.ok(h.hooks.get("session:context")?.length === 1);
-  assert.ok(h.hooks.get("session:generate")?.length === 1);
-  assert.ok(h.hooks.get("session:title")?.length === 1);
+  // All the hooks the v1 plugin relied on have v2 homes. The eviction guard
+  // is llama.cpp only; the request stamp and sampler strip exist once per
+  // local provider (llamacpp, strata).
+  const scopes = (name) => (h.hooks.get(name) ?? []).map((x) => x.opts?.providerID).sort();
+  assert.deepEqual(scopes("session:model.request"), ["llamacpp"]);
+  assert.deepEqual(scopes("session:http.request"), ["llamacpp", "strata"]);
+  for (const name of ["session:context", "session:generate", "session:title"]) {
+    assert.deepEqual(scopes(name), ["llamacpp", "strata"], name);
+  }
   assert.ok(h.hooks.get("session:compaction")?.length === 1);
   assert.ok(h.hooks.get("tool:execute.before")?.length === 1);
   assert.ok(h.hooks.get("tool:execute.after")?.length === 1);
+});
+
+// ------------------------------------------------------ sidekick routing
+
+// The repo's own opencode.jsonc agent table, in the fake's config shape. Under
+// v2 a model declared there beats the plugin, so routing is only real if the
+// table leaves the sidekick seats alone; reading the file guards that.
+function repoAgentTable() {
+  const text = fs.readFileSync(new URL("../opencode.jsonc", import.meta.url), "utf8");
+  let out = "", inStr = false, esc = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (inStr) { out += c; if (esc) esc = false; else if (c === "\\") esc = true; else if (c === '"') inStr = false; continue; }
+    if (c === '"') { inStr = true; out += c; continue; }
+    if (c === "/" && text[i + 1] === "/") { while (i < text.length && text[i] !== "\n") i++; out += "\n"; continue; }
+    out += c;
+  }
+  const cfg = JSON.parse(out.replace(/,(\s*[}\]])/g, "$1"));
+  const agents = {};
+  for (const [id, a] of Object.entries(cfg.agent)) {
+    const i = a.model?.indexOf("/");
+    agents[id] = {
+      mode: a.mode,
+      steps: a.steps,
+      ...(a.model ? { model: { providerID: a.model.slice(0, i), id: a.model.slice(i + 1), ...(a.variant ? { variant: a.variant } : {}) } } : {}),
+    };
+  }
+  return agents;
+}
+
+test("sidekick routing: fusion.jsonc picks scout, grunt and critic over the real agent table", async () => {
+  const ref = (spec, variant) => {
+    const i = spec.indexOf("/");
+    return { providerID: spec.slice(0, i), id: spec.slice(i + 1), ...(variant ? { variant } : {}) };
+  };
+  const cases = [
+    // [profile, scout+grunt, critic]
+    [{}, "strata/strata-iq3", "strata/strata-iq3"],
+    [{ sidekick: "strata-coder", critic: "strata" }, "strata/strata-coder", "strata/strata-coder"],
+    [{ sidekick: "strata", critic: "local" }, "strata/strata-iq3", "strata/strata-iq3"],
+    [{ sidekick: "local", critic: "local" }, "llamacpp/fusion-sidekick", "llamacpp/fusion-sidekick-deep"],
+    [{ sidekick: "local", critic: "strata" }, "llamacpp/fusion-sidekick", "strata/strata-iq3"],
+    [{ sidekick: "glm", critic: "local" }, "merge-gateway/zai/glm-5.3-flash", "merge-gateway/zai/glm-5.3-flash"],
+    [{ sidekick: "strata", critic: "lead" }, "strata/strata-iq3", ["merge-gateway/zai/glm-5.3", "low"]],
+  ];
+  for (const [profile, side, critic] of cases) {
+    const h = fakeCtx(makeDir(profile, defaultOpencodeCfg), { cfgAgents: repoAgentTable() });
+    await fusion.setup(h.ctx);
+    h.rebuild();
+    const label = JSON.stringify(profile);
+    assert.deepEqual(h.agents.get("scout").model, ref(side), label);
+    assert.deepEqual(h.agents.get("grunt").model, ref(side), label);
+    assert.deepEqual(h.agents.get("critic").model, Array.isArray(critic) ? ref(...critic) : ref(critic), label);
+  }
+
+  // Local seats carry the panel's per-agent effort; a remote seat carries none.
+  const h = fakeCtx(makeDir({ sidekick: "strata", critic: "flash" }, defaultOpencodeCfg), { cfgAgents: repoAgentTable() });
+  await fusion.setup(h.ctx);
+  h.rebuild();
+  assert.equal(h.agents.get("scout").request.body.chat_template_kwargs.reasoning_effort, "low");
+  assert.equal(h.agents.get("grunt").request.body.chat_template_kwargs.reasoning_effort, "medium");
+  assert.equal(h.agents.get("critic").request.body.chat_template_kwargs, undefined);
+});
+
+test("strata requests: per-agent effort, body model kept, no residency probe or guard", async () => {
+  const dir = makeDir({}, defaultOpencodeCfg);
+  const h = fakeCtx(dir);
+  await fusion.setup(h.ctx);
+  // Any fetch here would be a /v1/models probe or a guard read: Strata has neither.
+  const calls = [];
+  stubFetch(async (url) => { calls.push(String(url)); throw new Error("connection refused"); });
+
+  const model = { providerID: "strata", id: "strata-iq3" };
+  const send = async (agent, extra = {}) => {
+    await h.fireScoped("session:model.request", { sessionID: "s1", agent, model, baseURL: "http://127.0.0.1:8082/v1" });
+    const req = new Request("http://127.0.0.1:8082/v1/chat/completions", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "qwen3.8-flash-next-iq3_xxs", messages: [], ...extra }),
+    });
+    const ev = { sessionID: "s1", agent, model, kind: "primary", request: req };
+    await h.fireScoped("session:http.request", ev);
+    return JSON.parse(await ev.request.text());
+  };
+
+  const scout = await send("scout", { chat_template_kwargs: { enable_thinking: true } });
+  assert.equal(scout.model, "qwen3.8-flash-next-iq3_xxs");
+  assert.deepEqual(scout.chat_template_kwargs, { enable_thinking: true, reasoning_effort: "low" });
+  assert.equal((await send("critic")).chat_template_kwargs.reasoning_effort, "high");
+  assert.deepEqual(calls, []);
+});
+
+test("tool-output compression runs on Strata when the sidekick is Strata", async () => {
+  const dir = makeDir({ sidekick: "strata", compress_threshold: 5000 }, defaultOpencodeCfg);
+  const h = fakeCtx(dir);
+  await fusion.setup(h.ctx);
+  const calls = [];
+  stubFetch(async (url, init) => {
+    calls.push({ url: String(url), auth: new Headers(init?.headers).get("authorization"), body: JSON.parse(init?.body ?? "null") });
+    return { ok: true, status: 200, json: async () => ({ choices: [{ message: { content: "- 3 failures in src/a.ts" } }] }) };
+  });
+
+  const ev = toolEvent({
+    tool: "read", agent: "fusion", status: "completed",
+    input: { filePath: "big.log" },
+    result: { content: "x".repeat(20000) },
+  });
+  await h.fire("tool:execute.after", ev);
+
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url, "http://127.0.0.1:18082/v1/chat/completions");
+  assert.equal(calls[0].auth, "Bearer -strata-test-key");
+  assert.equal(calls[0].body.model, "strata-iq3");
+  assert.match(ev.result.content, /summarized by the local model/);
+  assert.match(ev.result.content, /3 failures in src\/a\.ts/);
 });
 
 // --------------------------------------------- http.request wire rewrite
@@ -446,7 +578,7 @@ test("http.request: no resident model or an unreadable server refuses the reques
 test("http.request: a request that does not target the llama-server port is untouched", async () => {
   // The provider filter is the primary scope, but the hook also self-guards
   // by URL: a foreign request through the raw callback cannot pick up a
-  // local wire id. Fired unscoped on purpose (no provider filter).
+  // local wire id. The llamacpp hooks are called raw on purpose.
   const dir = makeDir({}, defaultOpencodeCfg);
   const h = fakeCtx(dir);
   await fusion.setup(h.ctx);
@@ -459,7 +591,7 @@ test("http.request: a request that does not target the llama-server port is unto
     body: original,
   });
   const ev = { sessionID: "s1", agent: "fusion", kind: "primary", request: req };
-  await h.fire("session:http.request", ev);
+  await h.fireRegisteredFor("session:http.request", "llamacpp", ev);
   assert.equal(await ev.request.text(), original);
 });
 
@@ -661,24 +793,27 @@ test("model.request guard: warn logs and allows, off skips entirely", async () =
 
 // --------------------------------------------- samplers and compaction
 
-test("llamacpp requests lose tuned samplers; compaction injects state and orders", async () => {
+test("local requests lose tuned samplers; compaction injects state and orders", async () => {
   const dir = makeDir();
   const h = fakeCtx(dir);
   await fusion.setup(h.ctx);
 
-  const ev = {
-    sessionID: "s1",
-    model: { providerID: "llamacpp", id: "fusion-sidekick" },
-    agent: "scout",
-    system: [],
-    messages: [],
-    options: { temperature: 0.7, topP: 0.9, topK: 40, maxTokens: 100 },
-  };
-  await h.fireScoped("session:context", ev);
-  assert.equal(ev.options.temperature, undefined);
-  assert.equal(ev.options.topP, undefined);
-  assert.equal(ev.options.topK, undefined);
-  assert.equal(ev.options.maxTokens, 100); // untouched
+  // Both local servers own their sampling (llama-server unit, Strata config).
+  for (const model of [{ providerID: "llamacpp", id: "fusion-sidekick" }, { providerID: "strata", id: "strata-iq3" }]) {
+    const ev = {
+      sessionID: "s1",
+      model,
+      agent: "scout",
+      system: [],
+      messages: [],
+      options: { temperature: 0.7, topP: 0.9, topK: 40, maxTokens: 100 },
+    };
+    await h.fireScoped("session:context", ev);
+    assert.equal(ev.options.temperature, undefined, model.providerID);
+    assert.equal(ev.options.topP, undefined, model.providerID);
+    assert.equal(ev.options.topK, undefined, model.providerID);
+    assert.equal(ev.options.maxTokens, 100, model.providerID); // untouched
+  }
 
   // Compaction on the lead (non-llamacpp model) still injects controller state.
   const orders = { orders: { "ord-1": { status: "in_progress", seat: "chief" } } };

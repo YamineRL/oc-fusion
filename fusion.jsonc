@@ -39,31 +39,43 @@
   "claude_model": null,
 
   // Sidekick. Absorbs the bulk work.
-  //   local       the resident local model, medium effort   free
-  //   local-fast  same weights, low effort                  free
-  //   local-deep  same weights, high effort                 free
-  //   glm         zai/glm-5.3-flash                         $0.015/$0.05
-  //   deepseek    deepseek-v4-flash                         $0.035/$0.07
-  "sidekick": "local",
+  //   local         the resident local model, medium effort   free
+  //   local-fast    same weights, low effort                  free
+  //   local-deep    same weights, high effort                 free
+  //   glm           zai/glm-5.3-flash                         $0.015/$0.05
+  //   deepseek      deepseek-v4-flash                         $0.035/$0.07
+  //   strata        Strata general model on :8082 (IQ3_XXS by
+  //                 default; any qwen quant you run)          free
+  //   strata-coder  Strata Coder IQ1_M, :8082                 free
+  //                 needs the Coder model running in Strata
+  //                 instead of the general one
+  //   Strata shares the GPU with llama-server: run one at a time.
+  "sidekick": "strata",
 
   // Pin the local wire id (what llama-server knows the model as). null =
   // discover it from the running server at load, which is the default
-  // because it can never ask for a model that is not resident.
+  // because it can never ask for a model that is not resident. llama.cpp
+  // only: Strata serves one model, answers any name, ignores this knob.
   "local_model": null,
 
   // reasoning_effort injected per local agent (chat-template levels; a
   // template throws on one it does not know, so adjust to your model).
-  // Delete an entry to fall back to the server's unit-level default.
+  // Applies to both local providers. Delete an entry to fall back to the
+  // server's unit-level default (llama.cpp only: Strata has no unit, and
+  // nothing in this harness parses one for it).
   "local_efforts": { "scout": "low", "grunt": "medium", "critic": "xhigh" },
 
   // Who reviews diffs before work is called done. Independent of "sidekick":
-  // the default local critic is the weakest model in the fleet auditing the
+  // a local critic can be the weakest model in the fleet auditing the
   // strongest editor, which is backwards for subtle edits.
-  //   local  the resident local model, high effort (free, today's behavior)
-  //   flash  zai/glm-5.3-flash low effort (~fractions of a cent per review)
-  //   lead   the lead model itself at low effort (self-review, sub-cent at
-  //          glm prices; strongest reviewer available)
-  "critic": "local",
+  //   strata  the Strata model on :8082, high effort (free)
+  //   local   follows the sidekick: a Strata sidekick gives it the Strata
+  //           model, a remote sidekick the remote one; the llama.cpp deep
+  //           alias only with a local sidekick (free on local, billed remote)
+  //   flash   zai/glm-5.3-flash low effort (~fractions of a cent per review)
+  //   lead    the lead model itself at low effort (self-review, sub-cent at
+  //           glm prices; strongest reviewer available)
+  "critic": "strata",
 
   // normal | fast
   // fast = one notch less reasoning and a tighter step budget. Where the

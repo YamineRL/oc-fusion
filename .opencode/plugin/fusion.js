@@ -1,9 +1,14 @@
 // Fusion-style two-tier routing for opencode.
 //
-// Lead model does the thinking; the free local llama.cpp model absorbs the
-// bulk. Knobs live in fusion.jsonc and are applied to the agent set at load.
+// Lead model does the thinking; a free local model absorbs the bulk: Strata
+// (the default) or llama.cpp. Knobs live in fusion.jsonc and are applied to
+// the agent set at load.
 //
-// The local side is deliberately defensive: llama-server runs with
+// Strata serves one model and answers every model name with it, so it has no
+// eviction risk and no resident-id rewrite. It shares the per-agent effort
+// and the sampler strip with llama.cpp, and nothing else.
+//
+// The llama.cpp side is deliberately defensive: llama-server runs with
 // --models-max 1, so naming a model that is not resident evicts the resident
 // one mid-generation. Every local alias therefore sends the same wire id, and
 // the guard below refuses (or warns about) anything else.
@@ -37,6 +42,15 @@ import {
 // Machine-specific locations, overridable. Defaults follow XDG.
 const UNIT = process.env.FUSION_UNIT ?? path.join(os.homedir(), ".config/systemd/user/llama-server.service");
 const API_KEY_FILE = process.env.FUSION_API_KEY_FILE ?? path.join(os.homedir(), ".config/llama-server/api-key");
+// Strata (github.com/Niko1221/Strata). Keep in step with provider "strata"
+// in opencode.jsonc; only the tool-output summarizer calls it directly.
+const STRATA_URL = process.env.FUSION_STRATA_URL ?? "http://127.0.0.1:8082";
+const STRATA_KEY_FILE = process.env.FUSION_STRATA_KEY_FILE ?? path.join(os.homedir(), ".config/strata/api-key");
+
+// Providers that run on your own hardware. Both get the per-agent
+// local_efforts and the sampler strip; only llamacpp gets the resident-id
+// rewrite, the eviction guard and the context clamp.
+const LOCAL_PROVIDERS = ["llamacpp", "strata"];
 
 // ---------------------------------------------------------------- base models
 
@@ -73,24 +87,27 @@ const SIDEKICKS = {
   deepseek:     "merge-gateway/deepseek/deepseek-v4-flash",
   // Strata engine (github.com/Niko1221/Strata) on its own port. Its own
   // provider, not llamacpp, so the resident-id rewrite and eviction guard
-  // never touch it. "strata" is the IQ3_XXS general model (unit strata-iq3,
-  // on at boot). "strata-coder" needs the Coder unit (strata) running instead.
+  // never touch it. "strata" is the general model (IQ3_XXS by default; any
+  // full-expert size works, see the README). "strata-coder" is the Coder
+  // IQ1_M: Strata serves one model, so run the Coder instead of the general
+  // model before you select it.
   strata:         "strata/strata-iq3",
   "strata-coder": "strata/strata-coder",
 };
 
 // The critic reviews the lead's work, so it should not be a weaker model than
 // the edit it audits unless the user says so. Applied independently of the
-// sidekick knob.
+// sidekick knob. The string values are resolved at load in resolveFusion.
 const CRITICS = {
-  local: null, // leave the agent table's llamacpp/fusion-sidekick-deep alone
-  flash: { model: "merge-gateway/zai/glm-5.3-flash", variant: "low" },
-  lead:  "lead", // resolved at load: the lead's own model at low effort
+  local:  "local",  // llamacpp/fusion-sidekick-deep; follows a non-llama.cpp sidekick
+  strata: "strata", // the Strata model the sidekick uses, else strata-iq3
+  flash:  { model: "merge-gateway/zai/glm-5.3-flash", variant: "low" },
+  lead:   "lead",   // the lead's own model at low effort
 };
 
 const DEFAULTS = {
   base: "glm",
-  sidekick: "local",
+  sidekick: "strata",
   speed: "normal",
   reasoning: "high",
   // Where the lead goes when it cannot crack something.
@@ -103,7 +120,7 @@ const DEFAULTS = {
   guard: "warn",
   compress_tool_output: true,
   compress_threshold: 12000,
-  critic: "local",
+  critic: "strata",
   // Which wire id the local aliases send. null = discover from the running
   // llama-server (its --alias, or the .gguf basename). Discovery is the
   // default because naming a model that is not resident evicts whatever is
@@ -212,6 +229,19 @@ function readConfigWireIds(directory, providerID) {
     } catch { /* absent or unparsable config is not a plugin problem */ }
   }
   return wire;
+}
+
+// Key files are one key per line; # lines are comments. Take the first usable
+// line: the raw file puts comments and other keys into one Authorization
+// header, which fetch rejects.
+function readKeyFile(file) {
+  const key = fs
+    .readFileSync(file, "utf8")
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .find((l) => l && !l.startsWith("#"));
+  if (!key) throw new Error(`no API key found in ${file}`);
+  return key;
 }
 
 // Clamp a requested effort to what this model actually advertises, preferring
@@ -325,25 +355,45 @@ function resolveFusion(directory) {
   if (fast) leadEffort = stepDown(leadEffort, base.efforts);
   const leadModel = (fast && FAST_TWIN[base.model]) || base.model;
 
-  const sidekick = SIDEKICKS[profile.sidekick] ?? SIDEKICKS.local;
+  const sidekick = SIDEKICKS[profile.sidekick] ?? SIDEKICKS[DEFAULTS.sidekick];
   if (!SIDEKICKS[profile.sidekick]) {
-    console.error(`[fusion] unknown sidekick "${profile.sidekick}", falling back to "local". Known: ${Object.keys(SIDEKICKS).join(", ")}`);
+    console.error(`[fusion] unknown sidekick "${profile.sidekick}", falling back to "${DEFAULTS.sidekick}". Known: ${Object.keys(SIDEKICKS).join(", ")}`);
   }
-  // A remote sidekick has no local slot to protect and no 44k ceiling.
-  const sidekickIsLocal = sidekick.startsWith("llamacpp/");
+  const providerOf = (spec) => String(spec).split("/")[0];
+  // Only llama.cpp has a resident model to protect and a unit to clamp to.
+  const sidekickIsLlama = providerOf(sidekick) === "llamacpp";
+  const sidekickIsStrata = providerOf(sidekick) === "strata";
+  // Local = runs on your own hardware, so it costs nothing per token.
+  const sidekickIsLocal = LOCAL_PROVIDERS.includes(providerOf(sidekick));
 
-  // Note: CRITICS.local is null (meaning "leave the agent table alone"), so
-  // membership must be tested with hasOwn, not truthiness.
   const criticKnown = Object.hasOwn(CRITICS, profile.critic);
-  const criticChoice = criticKnown ? CRITICS[profile.critic] : CRITICS.local;
+  const criticChoice = criticKnown ? CRITICS[profile.critic] : CRITICS[DEFAULTS.critic];
   if (!criticKnown) {
-    console.error(`[fusion] unknown critic "${profile.critic}", falling back to "local". Known: ${Object.keys(CRITICS).join(", ")}`);
+    console.error(`[fusion] unknown critic "${profile.critic}", falling back to "${DEFAULTS.critic}". Known: ${Object.keys(CRITICS).join(", ")}`);
   }
   const criticEffort = clampEffort("low", base.efforts);
+  // Always a concrete { model, variant? }: opencode.jsonc names no critic
+  // model, because under v2 a model in the agent table beats the plugin.
   const criticPatch =
     criticChoice === "lead"
       ? { model: leadModel, ...(criticEffort ? { variant: criticEffort } : {}) }
-      : criticChoice; // null (local) or { model, variant }
+      : criticChoice === "strata"
+        // Strata serves one model: a critic on the other Strata alias would
+        // reach the same server with the wrong context limit.
+        ? { model: sidekickIsStrata ? sidekick : SIDEKICKS.strata }
+        : criticChoice === "local"
+          // A remote or Strata sidekick takes the critic seat with it.
+          ? { model: sidekickIsLlama ? "llamacpp/fusion-sidekick-deep" : sidekick }
+          : criticChoice;
+  const usesLlama = sidekickIsLlama || providerOf(criticPatch.model) === "llamacpp";
+
+  // reasoning_effort for one local request: the panel's per-agent value, else
+  // the llama-server unit's default (llama.cpp only), else medium. Fast mode
+  // drops scout to low.
+  function effortFor(agent, providerID) {
+    const asked = profile.local_efforts?.[String(agent ?? "")] ?? (providerID === "llamacpp" ? unit.effort : null) ?? "medium";
+    return fast && String(agent) === "scout" ? "low" : asked;
+  }
 
   const resident = residentModels();
   // The wire id every local alias sends: pinned via the panel, else whatever
@@ -357,7 +407,7 @@ function resolveFusion(directory) {
   const cfgWireIds = readConfigWireIds(directory, "llamacpp");
   // Router presets put context flags on the child, not the systemd unit.
   const localRuntime = resident.get(localWireId);
-  if (!localWireId) {
+  if (!localWireId && usesLlama) {
     console.error("[fusion] no local model pinned and none resident (is llama-server running?). Local agents will fail until it is up.");
   }
 
@@ -595,10 +645,8 @@ function resolveFusion(directory) {
   const banner = [
     `[fusion] lead ${leadModel}${leadEffort ? ` (${leadEffort})` : ""}`,
     `sidekick ${sidekick}${sidekickIsLocal ? " [free]" : ""}`,
-    `critic ${
-      criticPatch
-        ? `${criticPatch.model}${profile.critic === "lead" ? " (self-review)" : ""}`
-        : "llamacpp/fusion-sidekick-deep [free]"
+    `critic ${criticPatch.model}${
+      profile.critic === "lead" ? " (self-review)" : LOCAL_PROVIDERS.includes(providerOf(criticPatch.model)) ? " [free]" : ""
     }`,
     `escalate ${
       profile.escalation === "fable"
@@ -619,10 +667,10 @@ function resolveFusion(directory) {
           : `[fusion] note: ${base.model} advertises no reasoning levels, so fast = just the tighter step budget for it.`,
       );
     }
-    if (unit.ctx) {
+    if (unit.ctx && usesLlama) {
       console.error(`[fusion] llama-server unit: ctx ${unit.ctx}, parallel ${unit.parallel}, models-max ${unit.modelsMax}, idle-sleep ${unit.idle}s`);
     }
-    if (sidekickIsLocal && resident.size && !resident.has(localWireId)) {
+    if (sidekickIsLlama && resident.size && !resident.has(localWireId)) {
       console.error(`[fusion] WARNING: sidekick wants "${localWireId}" but resident is "${[...resident.keys()].join(", ")}". First sidekick call will evict it.`);
     }
   }
@@ -869,27 +917,30 @@ function resolveFusion(directory) {
     };
   }
 
+  // The summarizer runs on the sidekick's own local server: Strata when the
+  // sidekick is Strata, else llama-server (also for a remote sidekick, as
+  // before: summaries stay free or are skipped).
   async function localSummarize({ tool: toolName, middle }) {
-    // llama-server's key file is one key per line; # lines are comments.
-    // Take the first usable line: the raw file puts comments and other keys
-    // into one Authorization header, which fetch rejects.
-    const key = fs
-      .readFileSync(API_KEY_FILE, "utf8")
-      .split(/\r?\n/)
-      .map((l) => l.trim())
-      .find((l) => l && !l.startsWith("#"));
-    if (!key) throw new Error(`no API key found in ${API_KEY_FILE}`);
-    const port = unit.port ?? 8080;
-    const base = `http://127.0.0.1:${port}`;
-    // Same rule as the wire stamp: a load-time name can be stale, so the
-    // resident model is re-read here. A bad read means no summarizer call.
-    const wireId = pickWireId(await readResidentLive(base, { authorization: `Bearer ${key}` }));
-    if (!wireId) throw new Error("no resident model on llama-server; refusing to name one");
+    let base, key, model;
+    if (sidekickIsStrata) {
+      base = STRATA_URL;
+      key = readKeyFile(STRATA_KEY_FILE);
+      // Strata answers every model name with the one model it serves, so
+      // the alias cannot evict anything.
+      model = sidekick.slice(sidekick.indexOf("/") + 1);
+    } else {
+      base = `http://127.0.0.1:${unit.port ?? 8080}`;
+      key = readKeyFile(API_KEY_FILE);
+      // Same rule as the wire stamp: a load-time name can be stale, so the
+      // resident model is re-read here. A bad read means no summarizer call.
+      model = pickWireId(await readResidentLive(base, { authorization: `Bearer ${key}` }));
+      if (!model) throw new Error("no resident model on llama-server; refusing to name one");
+    }
     const res = await fetch(`${base}/v1/chat/completions`, {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` },
       body: JSON.stringify({
-        model: wireId, // resident model only; never triggers a load
+        model,
         stream: false,
         max_tokens: 1200,
         chat_template_kwargs: { reasoning_effort: "low" },
@@ -905,7 +956,7 @@ function resolveFusion(directory) {
         ],
       }),
     });
-    if (!res.ok) throw new Error(`llama-server returned ${res.status}`);
+    if (!res.ok) throw new Error(`${sidekickIsStrata ? "strata" : "llama-server"} returned ${res.status}`);
     const json = await res.json();
     return json?.choices?.[0]?.message?.content?.trim() || null;
   }
@@ -922,8 +973,8 @@ function resolveFusion(directory) {
 
   return {
     profile, unit, base, oracleBase, oracleEffort, fast, leadEffort, leadModel,
-    sidekick, sidekickIsLocal, criticPatch, resident, localWireId, localRuntime,
-    cfgWireIds, readResidentLive, pickWireId,
+    sidekick, sidekickIsLocal, sidekickIsLlama, criticPatch, resident, localWireId, localRuntime,
+    cfgWireIds, readResidentLive, pickWireId, effortFor,
     ctrl, fusionDir, controlLog, ordersFile, inboxDir, outboxDir,
     logControl, graftBin, hasGraft, graftJson, fileScope, blastTick,
     measureFileScope, measureDiffScope, readOrders, writeOrders, listInbox,
@@ -942,11 +993,11 @@ export const server = async ({ directory }) => {
   const F = resolveFusion(directory);
   const {
     profile, unit, oracleBase, oracleEffort, fast, leadEffort, leadModel,
-    sidekick, sidekickIsLocal, criticPatch, resident, localWireId, localRuntime,
+    sidekick, sidekickIsLocal, sidekickIsLlama, criticPatch, resident, localWireId, localRuntime,
     ctrl, inboxDir, outboxDir, logControl, graftBin, hasGraft, fileScope,
     blastTick, measureFileScope, measureDiffScope, readOrders, writeOrders,
     listInbox, stallsSummary, appendUsage, banner, printBanner,
-    escalateImpl, workOrderImpl, localSummarize,
+    escalateImpl, workOrderImpl, localSummarize, effortFor,
   } = F;
   const { tool } = await import("@opencode-ai/plugin");
 
@@ -1089,11 +1140,9 @@ export const server = async ({ directory }) => {
         }
       }
 
-      // The critic is applied after the sidekick block on purpose: when the
-      // sidekick is remote, critic follows it unless the critic knob overrides.
-      if (criticPatch) set("critic", criticPatch);
-      else if (!sidekickIsLocal) set("critic", { model: sidekick });
-      // else: critic keeps llamacpp/fusion-sidekick-deep from the agent table
+      // The critic knob is resolved in resolveFusion (critic "local" follows
+      // a non-llama.cpp sidekick).
+      set("critic", criticPatch);
 
       // Prefer the resident child's flags: router presets can override the
       // unit. Follow increases as well as decreases, reserving 1024 tokens
@@ -1186,14 +1235,15 @@ export const server = async ({ directory }) => {
         agentBySession.delete(agentBySession.keys().next().value);
       }
 
-      const isLocal = input.model?.providerID === "llamacpp";
-      if (!isLocal) return;
+      const providerID = input.model?.providerID;
+      if (!LOCAL_PROVIDERS.includes(providerID)) return;
 
       const wire = input.model?.api?.id;
 
       // Eviction guard. The resident model is shared state; a stray model name
-      // unloads it and kills whatever it was generating.
-      if (profile.guard !== "off" && wire && resident.size && !resident.has(wire)) {
+      // unloads it and kills whatever it was generating. llama.cpp only:
+      // Strata answers every name with its one model, so nothing can evict.
+      if (providerID === "llamacpp" && profile.guard !== "off" && wire && resident.size && !resident.has(wire)) {
         const msg =
           `[fusion] "${wire}" is not resident (resident: ${[...resident.keys()].join(", ") || "none"}). ` +
           `llama-server runs --models-max ${unit.modelsMax ?? 1}, so this request would unload it mid-flight.`;
@@ -1203,17 +1253,16 @@ export const server = async ({ directory }) => {
         console.error(`${msg} Allowing because guard is "warn".`);
       }
 
-      // Sampling is tuned in the llama-server unit (temp 1.0 / top_p 0.95 /
-      // top_k 20 / min_p 0.0). Don't fight it from here.
+      // Sampling is tuned on the server (the llama-server unit, or Strata's
+      // config "sampling"). Don't fight it from here.
       delete output.temperature;
       delete output.topP;
       delete output.topK;
 
       // Per-agent reasoning effort, from the panel. llama.cpp reads this from
-      // chat_template_kwargs; it ignores a top-level reasoning_effort.
-      const byAgent = profile.local_efforts ?? {};
-      const asked = byAgent[input.agent] ?? unit.effort ?? "medium";
-      const want = fast && input.agent === "scout" ? "low" : asked;
+      // chat_template_kwargs; it ignores a top-level reasoning_effort. Strata
+      // reads both, and chat_template_kwargs wins.
+      const want = effortFor(input.agent, providerID);
       output.options = {
         ...(output.options ?? {}),
         chat_template_kwargs: {
@@ -1442,8 +1491,8 @@ const setupV2 = async (ctx) => {
   const F = resolveFusion(directory);
   const {
     profile, unit, oracleBase, oracleEffort, fast, leadEffort, leadModel,
-    sidekick, sidekickIsLocal, criticPatch, resident, localWireId, localRuntime,
-    cfgWireIds, readResidentLive, pickWireId,
+    sidekick, sidekickIsLocal, sidekickIsLlama, criticPatch, resident, localWireId, localRuntime,
+    cfgWireIds, readResidentLive, pickWireId, effortFor,
     ctrl, inboxDir, outboxDir, logControl, graftBin, hasGraft, fileScope,
     blastTick, measureFileScope, measureDiffScope, readOrders, writeOrders,
     listInbox, stallsSummary, appendUsage, banner, printBanner,
@@ -1492,33 +1541,29 @@ const setupV2 = async (ctx) => {
       seat("oracle", (a) => { a.hidden = true; });
     }
 
+    // These writes stick only because opencode.jsonc names no model for
+    // scout, grunt or critic: a model declared there beats this transform.
     const sideRef = refOf(sidekick);
     for (const id of ["scout", "grunt"]) seat(id, (a) => { a.mode = "subagent"; a.model = sideRef; });
 
-    // The critic is applied after the sidekick block on purpose: when the
-    // sidekick is remote, critic follows it unless the critic knob overrides.
-    const criticRef = criticPatch
-      ? refOf(criticPatch.model, criticPatch.variant)
-      : sidekickIsLocal
-        ? null // local: keep the agent table's llamacpp/fusion-sidekick-deep
-        : sideRef;
-    if (criticRef) seat("critic", (a) => { a.mode = "subagent"; a.model = criticRef; });
-    else seat("critic", (a) => { a.mode = "subagent"; });
+    // The critic knob is resolved in resolveFusion (critic "local" follows
+    // a non-llama.cpp sidekick).
+    const criticRef = refOf(criticPatch.model, criticPatch.variant);
+    seat("critic", (a) => { a.mode = "subagent"; a.model = criticRef; });
 
     // Per-agent local reasoning effort, the declarative copy. llama.cpp
-    // reads chat_template_kwargs from the request body; providerOptions
-    // silently drops the key, so it rides request.body. The authoritative
-    // stamp is the http.request hook below (it also reaches agents this
-    // transform cannot see, e.g. ones config declares after us).
+    // and Strata read chat_template_kwargs from the request body;
+    // providerOptions silently drops the key, so it rides request.body. The
+    // authoritative stamp is the http.request hook below (it also reaches
+    // agents this transform cannot see, e.g. ones config declares after us).
     const seats = [
       ["scout", sideRef],
       ["grunt", sideRef],
-      ["critic", criticRef ?? refOf("llamacpp/fusion-sidekick-deep")],
+      ["critic", criticRef],
     ];
     for (const [id, modelRef] of seats) {
-      if (modelRef?.providerID !== "llamacpp") continue;
-      const asked = profile.local_efforts?.[id] ?? unit.effort ?? "medium";
-      const want = fast && id === "scout" ? "low" : asked;
+      if (!LOCAL_PROVIDERS.includes(modelRef?.providerID)) continue;
+      const want = effortFor(id, modelRef.providerID);
       if (want == null) continue;
       seat(id, (a) => {
         a.request ??= { settings: {}, headers: {}, body: {} };
@@ -1696,8 +1741,9 @@ const setupV2 = async (ctx) => {
 
   // ----------------------------------------------------- session hooks
 
-  // Sampling is tuned in the llama-server unit (temp 1.0 / top_p 0.95 /
-  // top_k 20 / min_p 0.0). Don't fight it from here.
+  // Sampling is tuned on the server (the llama-server unit, or Strata's
+  // config "sampling": temp 1.0 / top_p 0.95 / top_k 20 / min_p 0.0).
+  // Don't fight it from here.
   const stripSampler = (options) => {
     if (!options || typeof options !== "object") return;
     delete options.temperature;
@@ -1705,9 +1751,27 @@ const setupV2 = async (ctx) => {
     delete options.topK;
   };
 
+  // Merge reasoning_effort into a request body's chat_template_kwargs (both
+  // llama.cpp and Strata read it there). Returns false when there is no
+  // effort to send.
+  const stampEffort = (json, want) => {
+    if (!want) return false;
+    json.chat_template_kwargs = {
+      ...(json.chat_template_kwargs && typeof json.chat_template_kwargs === "object" ? json.chat_template_kwargs : {}),
+      reasoning_effort: want,
+    };
+    return true;
+  };
+  const rebuildRequest = (req, json) => {
+    const headers = new Headers(req.headers);
+    headers.delete("content-length"); // stale length would truncate the new body
+    return new Request(req.url, { method: req.method, headers, body: JSON.stringify(json) });
+  };
+
   // Eviction guard. Fires once per model call (primary, compaction, title,
   // generate), scoped to llamacpp. The resident model is shared state; a
   // stray model name unloads it and kills whatever it was generating.
+  // Strata needs no guard: it answers every model name with its one model.
   // Residency is read live from /v1/models (never the load-time snapshot):
   // the model can change under a running server, and a server that was
   // down at load still gets checked the moment it answers. The wire name
@@ -1783,25 +1847,36 @@ const setupV2 = async (ctx) => {
       else if (!ids.has(json.model)) json.model = wireId;
       // else the body already names a resident id; leave it.
     }
-    const asked = profile.local_efforts?.[String(event.agent ?? "")] ?? unit.effort ?? "medium";
-    const want = fast && String(event.agent) === "scout" ? "low" : asked;
-    if (want) {
-      json.chat_template_kwargs = {
-        ...(json.chat_template_kwargs && typeof json.chat_template_kwargs === "object" ? json.chat_template_kwargs : {}),
-        reasoning_effort: want,
-      };
-    }
-    const headers = new Headers(req.headers);
-    headers.delete("content-length"); // stale length would truncate the new body
-    event.request = new Request(req.url, { method: req.method, headers, body: JSON.stringify(json) });
+    stampEffort(json, effortFor(event.agent, "llamacpp"));
+    event.request = rebuildRequest(req, json);
   }, { providerID: "llamacpp" }));
 
-  // The sampler strip covers every llamacpp request kind. (chat.params fired
+  // Strata gets the per-agent effort and nothing else: it serves one model
+  // and answers every name with it, so there is no wire id to rewrite and
+  // nothing to evict. Scoped by provider only, because Strata's port is
+  // whatever opencode.jsonc says.
+  registrations.push(await ctx.session.hook("http.request", async (event) => {
+    const req = event.request;
+    if (!req?.body) return;
+    let json;
+    try {
+      json = JSON.parse(await req.clone().text());
+    } catch {
+      return; // not JSON: not a chat request, leave it alone
+    }
+    if (!json || typeof json !== "object" || Array.isArray(json)) return;
+    if (!stampEffort(json, effortFor(event.agent, "strata"))) return;
+    event.request = rebuildRequest(req, json);
+  }, { providerID: "strata" }));
+
+  // The sampler strip covers every local request kind. (chat.params fired
   // for all of them in v1; v2 splits request construction per kind.)
-  for (const name of ["context", "generate", "title"]) {
-    registrations.push(await ctx.session.hook(name, (event) => {
-      stripSampler(event.options);
-    }, { providerID: "llamacpp" }));
+  for (const providerID of LOCAL_PROVIDERS) {
+    for (const name of ["context", "generate", "title"]) {
+      registrations.push(await ctx.session.hook(name, (event) => {
+        stripSampler(event.options);
+      }, { providerID }));
+    }
   }
 
   // Compaction is exactly where "two honest attempts" used to die: the retry
@@ -1810,7 +1885,7 @@ const setupV2 = async (ctx) => {
   // carries the counters, not a memory of them. Runs for every provider:
   // the controller tracks harness state, not llamacpp state.
   registrations.push(await ctx.session.hook("compaction", (event) => {
-    if (event.model?.providerID === "llamacpp") stripSampler(event.options);
+    if (LOCAL_PROVIDERS.includes(event.model?.providerID)) stripSampler(event.options);
     event.system.push({
       type: "text",
       text: renderControllerState(ctrl, {

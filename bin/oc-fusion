@@ -3,13 +3,15 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PROFILE="$ROOT/fusion.jsonc"
+# Same precedence as the plugin's readProfile: FUSION_PROFILE wins over the
+# harness panel.
+PROFILE="${FUSION_PROFILE:-$ROOT/fusion.jsonc}"
 UNIT="$HOME/.config/systemd/user/llama-server.service"
 
 BASES="union-alpha glm glm-flash fable astra sol opus"
 GRAFT_CMDS="build check map ask grep skeleton callers blast mcp"
-SIDEKICKS="local local-fast local-deep glm deepseek"
-CRITICS="local flash lead"
+SIDEKICKS="local local-fast local-deep glm deepseek strata strata-coder"
+CRITICS="local strata flash lead"
 SPEEDS="normal fast"
 EFFORTS="low medium high xhigh max"
 GUARDS="strict warn off"
@@ -60,6 +62,62 @@ resident() {
   }'
 }
 
+# The Strata model the panel uses ("" when sidekick and critic are not Strata):
+# a strata-* sidekick, else strata-iq3 for critic "strata".
+strata_alias() {
+  local sk cr
+  sk=$(get_key sidekick); cr=$(get_key critic)
+  case "$sk" in
+    strata) echo strata-iq3 ;;
+    strata-*) echo "$sk" ;;
+    *) [ "$cr" = "strata" ] && echo strata-iq3 || true ;;
+  esac
+}
+
+# Passive: Strata's /health needs no key and never loads a model. Prints
+# "<base> <declared id> <declared context> <served id> <max_context> <loaded>"
+# for one alias of provider "strata" in opencode.jsonc.
+strata_health() {
+  python3 - "$ROOT/opencode.jsonc" "$1" <<'PY'
+import json, re, sys, urllib.request
+path, alias = sys.argv[1:3]
+s = open(path).read()
+s = re.sub(r'"(?:[^"\\]|\\.)*"|//[^\n]*', lambda m: m.group(0) if m.group(0).startswith('"') else "", s)
+p = json.loads(re.sub(r",(\s*[}\]])", r"\1", s))["provider"]["strata"]
+base = p["options"]["baseURL"].rstrip("/").removesuffix("/v1")
+m = p["models"].get(alias, {})
+try:
+    h = json.load(urllib.request.urlopen(base + "/health", timeout=2))
+except Exception:
+    h = {}
+print(base, m.get("id", "?"), m.get("limit", {}).get("context", "?"),
+      h.get("model", "-"), h.get("max_context", "-"), str(h.get("loaded", "-")).lower())
+PY
+}
+
+# Same JSONC parse strata_health uses, scoped to one provider's fields.
+# Grepping the whole file for these now catches the Strata and gateway
+# entries and warns on things this panel never asked llama-server for.
+# Usage: provider_json <provider> base|contexts|ids
+provider_json() {
+  python3 - "$ROOT/opencode.jsonc" "$1" "$2" <<'PY'
+import json, re, sys
+s = open(sys.argv[1]).read()
+s = re.sub(r'"(?:[^"\\]|\\.)*"|//[^\n]*', lambda m: m.group(0) if m.group(0).startswith('"') else "", s)
+p = json.loads(re.sub(r",(\s*[}\]])", r"\1", s)).get("provider", {}).get(sys.argv[2], {})
+what = sys.argv[3]
+if what == "base":
+    print(p.get("options", {}).get("baseURL", ""))
+elif what == "contexts":
+    ctxs = sorted(c for c in {m.get("limit", {}).get("context")
+                              for m in p.get("models", {}).values()}
+                  if isinstance(c, int))
+    print(" ".join(map(str, ctxs)))
+elif what == "ids":
+    print(" ".join(sorted({m["id"] for m in p.get("models", {}).values() if m.get("id")})))
+PY
+}
+
 usage() {
   cat <<EOF
 usage: oc-fusion <command>
@@ -75,7 +133,7 @@ usage: oc-fusion <command>
   guard      <$(echo $GUARDS | tr ' ' '|')>
   compress   <on|off>
   usage                  aggregate .fusion/usage.jsonl (per-agent tokens + cost)
-  doctor                 check the config against the llama-server unit
+  doctor                 check the config against Strata and the llama-server unit
   graft      <build|check|map|ask|grep|skeleton|callers|blast|mcp> [args...]
                          local graph in your current project; network-isolated
                          on Linux (unshare required). See oc-fusion graft help.
@@ -102,8 +160,18 @@ case "$cmd" in
     esac
     echo "guard     $(get_key guard)   compress $(get_key compress_tool_output)   routing $(get_key routing)"
     echo
+    sa=$(strata_alias)
+    if [ -n "$sa" ]; then
+      read -r s_base s_id _ s_model _ s_loaded <<<"$(strata_health "$sa")"
+      if [ "$s_model" = "-" ]; then
+        echo "strata    not answering at $s_base"
+      else
+        echo "strata    $s_model at $s_base (loaded: $s_loaded)"
+        [ "$s_model" != "$s_id" ] && echo "  WARN: $sa expects \"$s_id\"; run that model in Strata or pick the other strata sidekick."
+      fi
+    fi
     local_res=$(resident || true)
-    echo "resident  ${local_res:-<nothing loaded>}"
+    echo "resident  ${local_res:-<nothing loaded>} (llama-server)"
     if command -v systemctl >/dev/null; then
       echo "service   llama-server.service: $(systemctl --user is-active llama-server.service 2>/dev/null || echo unknown)"
     fi
@@ -263,39 +331,76 @@ EOF
     exec unshare --user --map-root-user --net -- graft "$@"
     ;;
   doctor)
-    [ -f "$UNIT" ] || die "no llama-server unit at $UNIT"
-    ctx=$(grep -oP '(?<=-c )\d+' "$UNIT" | head -1)
-    par=$(grep -oP '(?<=--parallel )\d+' "$UNIT" | head -1)
-    mmax=$(grep -oP '(?<=--models-max )\d+' "$UNIT" | head -1)
-    port=$(grep -oP '(?<=--port )\d+' "$UNIT" | head -1)
-    echo "unit      ctx=$ctx parallel=$par models-max=$mmax port=$port"
-    declared=$(grep -oP '"context":\s*\K\d+' "$ROOT/opencode.jsonc" | sort -un | tr '\n' ' ')
-    echo "declared  local context: $declared"
-    for d in $declared; do
-      if [ "$d" -ge "$ctx" ]; then
-        echo "  WARN: declared $d >= server $ctx; opencode may pack a prompt the server rejects."
+    sk=$(get_key sidekick)
+    # Strata first when the panel uses it (a strata-* sidekick, or critic
+    # "strata"): the declared alias checked passively against /health, which
+    # needs no key and never loads a model.
+    sa=$(strata_alias)
+    if [ -n "$sa" ]; then
+      read -r s_base s_id s_ctx s_model s_max s_loaded <<<"$(strata_health "$sa")"
+      if [ "$s_model" = "-" ]; then
+        echo "strata    WARN: Strata not answering at $s_base; start the Strata model for $sa."
+      else
+        echo "strata    $s_base serving \"$s_model\" max_context=$s_max loaded=$s_loaded"
+        if [ "$s_model" != "$s_id" ]; then
+          echo "  WARN: the panel names \"$s_id\" ($sa) but Strata serves \"$s_model\"."
+          echo "        Requests still work: Strata ignores the model name, but the"
+          echo "        panel and the server disagree. Pick the served model with"
+          echo "        \`oc-fusion sidekick strata|strata-coder\`, or set that alias's"
+          echo "        \"id\" in opencode.jsonc."
+        fi
+        if [ "$s_ctx" != "?" ] && [ "$s_max" != "-" ] && [ "$s_ctx" -gt "$s_max" ]; then
+          echo "  WARN: declared $s_ctx > server $s_max; opencode may pack a prompt the server rejects."
+        fi
       fi
-    done
-    base_url=$(grep -oP 'baseURL":\s*"\K[^"]+' "$ROOT/opencode.jsonc" | head -1)
-    echo "baseURL   $base_url"
-    case "$base_url" in
-      *":$port/"*) echo "  ok: baseURL port matches the unit." ;;
-      *) echo "  WARN: baseURL does not use the unit's port ($port)." ;;
-    esac
-    r=$(resident || true)
-    echo "resident  ${r:-<nothing loaded>}"
-    if [ -n "$r" ]; then
-      # The plugin stamps the resident wire id onto the local aliases at
-      # load, so any pinned "id" here is a stale pin, not the source of truth.
-      pinned=$(grep -oP '"id":\s*"\K[^"]+' "$ROOT/opencode.jsonc" | sort -u | tr '\n' ' ')
-      for p in $pinned; do
-        [ "$p" != "$r" ] && [ "$p" != "local" ] && echo "  WARN: pinned \"$p\" differs from resident \"$r\"; the plugin will use the resident model."
-      done
-    else
-      echo "  WARN: nothing resident; local agents will fail until a model is loaded."
+      skey="${FUSION_STRATA_KEY_FILE:-$HOME/.config/strata/api-key}"
+      if [ -s "$skey" ]; then
+        echo "  ok: api key file $skey present."
+      else
+        echo "  WARN: api key file $skey missing or empty; Strata requests will be rejected."
+      fi
     fi
-    [ "$mmax" = "1" ] && echo "note      models-max=1: only one local model can be resident at a time."
-    [ "$par" = "1" ] && echo "note      parallel=1: concurrent local calls queue rather than overlap."
+    # llama.cpp: the checks only apply when a unit exists, and only to
+    # provider.llamacpp in opencode.jsonc (scoped by provider_json, not by
+    # grepping the file).
+    if [ -f "$UNIT" ]; then
+      ctx=$(grep -oP '(?<=-c )\d+' "$UNIT" | head -1)
+      par=$(grep -oP '(?<=--parallel )\d+' "$UNIT" | head -1)
+      mmax=$(grep -oP '(?<=--models-max )\d+' "$UNIT" | head -1)
+      port=$(grep -oP '(?<=--port )\d+' "$UNIT" | head -1)
+      echo "unit      ctx=$ctx parallel=$par models-max=$mmax port=$port"
+      declared=$(provider_json llamacpp contexts)
+      echo "declared  local context: $declared"
+      for d in $declared; do
+        if [ "$d" -ge "$ctx" ]; then
+          echo "  WARN: declared $d >= server $ctx; opencode may pack a prompt the server rejects."
+        fi
+      done
+      base_url=$(provider_json llamacpp base)
+      echo "baseURL   $base_url"
+      case "$base_url" in
+        *":$port/"*) echo "  ok: baseURL port matches the unit." ;;
+        *) echo "  WARN: baseURL does not use the unit's port ($port)." ;;
+      esac
+      r=$(resident || true)
+      echo "resident  ${r:-<nothing loaded>}"
+      if [ -n "$r" ]; then
+        # The plugin stamps the resident wire id onto the local aliases at
+        # load, so any pinned "id" here is a stale pin, not the source of truth.
+        pinned=$(provider_json llamacpp ids)
+        for p in $pinned; do
+          [ "$p" != "$r" ] && [ "$p" != "local" ] && echo "  WARN: pinned \"$p\" differs from resident \"$r\"; the plugin will use the resident model."
+        done
+      else
+        echo "  WARN: nothing resident; local agents will fail until a model is loaded."
+      fi
+      [ "$mmax" = "1" ] && echo "note      models-max=1: only one local model can be resident at a time."
+      [ "$par" = "1" ] && echo "note      parallel=1: concurrent local calls queue rather than overlap."
+    elif in_list "$sk" local local-fast local-deep; then
+      echo "llama     WARN: no unit at $UNIT but sidekick \"$sk\" runs on llama-server."
+    else
+      echo "llama     no unit at $UNIT (not used by this panel; skipped)"
+    fi
     # Graft is part of the setup: the graph lives per-project, the CLI global.
     if command -v graft >/dev/null; then
       echo "graft     $(graft --version 2>/dev/null || echo installed)"

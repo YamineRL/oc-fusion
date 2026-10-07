@@ -12,7 +12,11 @@
   // shared card free for work you actually asked for.
   "small_model": "merge-gateway/zai/glm-5.3-flash",
 
-  "plugin": ["./.opencode/plugin/fusion.js", "./.opencode/plugin/rtk.ts"],
+  // Plugins auto-load from .opencode/plugin/ in alphabetical order, which
+  // puts fusion.js ahead of rtk.ts (fusion must see commands before rtk
+  // rewrites them). Keep the list empty: v2 only accepts directories here
+  // and drops file paths with a warning.
+  "plugin": [],
 
   // Fusion's efficiency comes from fewer, fatter round trips.
   "experimental": {
@@ -108,9 +112,12 @@
         }
       }
     },
-    // Strata engine (github.com/Niko1221/Strata), Qwen3.8-Flash-Next Coder
-    // IQ1_M. Separate port and key from llama-server. Selected with
-    // `oc-fusion sidekick strata`.
+    // Strata engine (github.com/Niko1221/Strata): the default sidekick.
+    // Qwen3.8-Flash-Next on one GPU plus system RAM. Separate port and key
+    // from llama-server; Strata's own default port is 8080, so start it with
+    // --port 8082 or change baseURL. Strata serves one model and answers
+    // every model name with it: "id" is a label, but "limit.context" must
+    // not exceed the max_context Strata reports (`oc-fusion doctor` checks).
     "strata": {
       "npm": "@ai-sdk/openai-compatible",
       "name": "Strata (local)",
@@ -119,7 +126,10 @@
         "apiKey": "{file:~/.config/strata/api-key}"
       },
       "models": {
-        // IQ3_XXS general model: what unit strata-iq3 serves (on at boot).
+        // `oc-fusion sidekick strata`: strata-iq3 is the general-model
+        // alias. Run another quant (IQ3_S, IQ2_XS, ...)? Set "id" to the
+        // "model" /health reports and "limit.context" to its "max_context".
+        // The alias name stays the same.
         "strata-iq3": {
           "id": "qwen3.8-flash-next-iq3_xxs",
           "name": "Strata IQ3_XXS",
@@ -130,7 +140,8 @@
           "limit": { "context": 98304, "output": 16384 },
           "cost": { "input": 0, "output": 0 }
         },
-        // Coder IQ1_M: only when unit strata runs instead of strata-iq3.
+        // `oc-fusion sidekick strata-coder`: Coder IQ1_M. Strata serves one
+        // model, so run the Coder instead of the general model first.
         "strata-coder": {
           "id": "qwen3.8-flash-next-coder-iq1_m",
           "name": "Strata Coder (IQ1_M)",
@@ -168,7 +179,10 @@
     "scout": {
       "description": "Read-only explorer on the local model. Use for finding files, tracing call sites, summarizing how something works. Returns findings, never patches.",
       "mode": "subagent",
-      "model": "strata/strata-iq3",
+      // No "model" here on purpose, also for grunt and critic: under v2 a
+      // model in this table beats the plugin, and the fusion plugin sets
+      // these seats from fusion.jsonc ("sidekick", "critic"). Without the
+      // plugin they fall back to the top-level "model".
       "prompt": "{file:./prompts/scout.md}",
       "steps": 60,
       "permission": {
@@ -182,7 +196,7 @@
           "wc *": "allow", "head *": "allow", "tail *": "allow",
           // Graft read-query forms only (via the harness forwarder): locate,
           // trace, orient. Never build/init/uninstall. Queries may refresh the
-          // local graft/ cache — a structural local rebuild, not a write to the
+          // local graft/ cache: a structural local rebuild, not a write to the
           // project's source.
           "oc-fusion graft ask*": "allow",
           "oc-fusion graft grep*": "allow",
@@ -196,7 +210,6 @@
     "grunt": {
       "description": "Mechanical editor on the local model. Use for well-specified changes: renames, applying a described patch, wiring boilerplate, fixing a failing test whose cause is known.",
       "mode": "subagent",
-      "model": "strata/strata-iq3",
       "prompt": "{file:./prompts/grunt.md}",
       "steps": 80,
       // Same deny-everything default as fusion: no ruleset, no tool calls.
@@ -219,7 +232,6 @@
     "critic": {
       "description": "Reviews a diff for correctness before you call the work done.",
       "mode": "subagent",
-      "model": "llamacpp/fusion-sidekick-deep",
       "prompt": "{file:./prompts/critic.md}",
       "steps": 40,
       "permission": { "edit": "deny", "write": "deny" }
