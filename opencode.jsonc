@@ -12,11 +12,14 @@
   // shared card free for work you actually asked for.
   "small_model": "merge-gateway/zai/glm-5.3-flash",
 
-  // Plugins auto-load from .opencode/plugin/ in alphabetical order, which
-  // puts fusion.js ahead of rtk.ts (fusion must see commands before rtk
-  // rewrites them). Keep the list empty: v2 only accepts directories here
-  // and drops file paths with a warning.
-  "plugin": [],
+  // `oc` runs opencode in your project, so the project's own .opencode/
+  // auto-discovery never finds the harness plugins: this list is what loads
+  // them. Paths are relative to this file. Entries are directories: v2 drops
+  // a file path with "configured plugin path must be a directory", and v1
+  // loads the directory's index. Order matters: fusion must see commands
+  // before rtk rewrites them. Keep plugin files out of .opencode/plugin/, or
+  // opencode in this repo loads them twice ("Duplicate plugin ID").
+  "plugin": ["./plugins/fusion", "./plugins/rtk"],
 
   // Fusion's efficiency comes from fewer, fatter round trips.
   "experimental": {

@@ -47,7 +47,7 @@ process.env.FUSION_API_KEY_FILE = path.join(ROOT, "api-key");
 process.env.FUSION_STRATA_URL = "http://127.0.0.1:18082";
 process.env.FUSION_STRATA_KEY_FILE = path.join(ROOT, "strata-key");
 
-const fusion = (await import("../.opencode/plugin/fusion.js")).default;
+const fusion = (await import("../plugins/fusion/index.js")).default;
 
 function makeDir(profile = {}, opencodeCfg = null) {
   const dir = fs.mkdtempSync(path.join(ROOT, "proj-"));
@@ -356,12 +356,9 @@ test("v2 setup: transform ordering, oracle hidden, tools, hooks", async () => {
   assert.ok(h.hooks.get("tool:execute.after")?.length === 1);
 });
 
-// ------------------------------------------------------ sidekick routing
+// ------------------------------------------------------ plugin list
 
-// The repo's own opencode.jsonc agent table, in the fake's config shape. Under
-// v2 a model declared there beats the plugin, so routing is only real if the
-// table leaves the sidekick seats alone; reading the file guards that.
-function repoAgentTable() {
+function repoConfig() {
   const text = fs.readFileSync(new URL("../opencode.jsonc", import.meta.url), "utf8");
   let out = "", inStr = false, esc = false;
   for (let i = 0; i < text.length; i++) {
@@ -371,7 +368,41 @@ function repoAgentTable() {
     if (c === "/" && text[i + 1] === "/") { while (i < text.length && text[i] !== "\n") i++; out += "\n"; continue; }
     out += c;
   }
-  const cfg = JSON.parse(out.replace(/,(\s*[}\]])/g, "$1"));
+  return JSON.parse(out.replace(/,(\s*[}\]])/g, "$1"));
+}
+
+// `oc` runs opencode in the user's project, not in the harness, so the
+// project-local auto-discovery never sees the harness plugins: only the
+// config's `plugin` list loads them. v2 drops a file entry ("configured
+// plugin path must be a directory") and v1 resolves a directory to its
+// index, so each entry must be a directory with an index file. A plugin file
+// left under .opencode/plugin(s)/ also auto-loads when opencode runs in the
+// harness itself and fails there as a duplicate plugin ID.
+test("plugin list: fusion then rtk load from directories, nothing auto-discovered beside them", async () => {
+  const root = new URL("../", import.meta.url).pathname;
+  const ids = [];
+  for (const entry of repoConfig().plugin ?? []) {
+    const dir = path.resolve(root, entry);
+    assert.ok(fs.statSync(dir).isDirectory(), `${entry} is not a directory`);
+    const index = ["index.js", "index.ts"].map((f) => path.join(dir, f)).find((f) => fs.existsSync(f));
+    assert.ok(index, `${entry} has no index.js or index.ts`);
+    ids.push((await import(index)).default.id);
+  }
+  assert.deepEqual(ids, ["fusion", "rtk"]);
+  for (const sub of ["plugin", "plugins"]) {
+    const dir = path.join(root, ".opencode", sub);
+    const files = fs.existsSync(dir) ? fs.readdirSync(dir).filter((f) => /\.(m?js|ts)$/.test(f)) : [];
+    assert.deepEqual(files, [], `.opencode/${sub}/ would auto-load a second copy`);
+  }
+});
+
+// ------------------------------------------------------ sidekick routing
+
+// The repo's own opencode.jsonc agent table, in the fake's config shape. Under
+// v2 a model declared there beats the plugin, so routing is only real if the
+// table leaves the sidekick seats alone; reading the file guards that.
+function repoAgentTable() {
+  const cfg = repoConfig();
   const agents = {};
   for (const [id, a] of Object.entries(cfg.agent)) {
     const i = a.model?.indexOf("/");

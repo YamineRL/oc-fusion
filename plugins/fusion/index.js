@@ -22,6 +22,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { spawn, spawnSync } from "node:child_process";
+import { pathToFileURL } from "node:url";
 import {
   normalizeCommand,
   isVerificationCommand,
@@ -181,7 +182,7 @@ function stripJsonc(text) {
 }
 
 // The harness root, i.e. where this plugin lives, two levels up from
-// .opencode/plugin/. Used so the control panel is found when opencode runs in
+// plugins/fusion/. Used so the control panel is found when opencode runs in
 // some other repo rather than in the harness directory itself.
 const HARNESS = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..", "..");
 
@@ -989,6 +990,26 @@ function resolveFusion(directory) {
 // returned hook object. Kept because the Mac still runs v1; the file stays
 // one source of truth for both versions.
 
+// v1 only. The plugin lives in plugins/fusion/, so no node_modules is on its
+// resolve path. v1 installs @opencode-ai/plugin into its global config dir
+// (and into a .opencode/ it loads), so look there when the bare import fails.
+async function importPluginSdk() {
+  try {
+    return await import("@opencode-ai/plugin");
+  } catch (err) {
+    const configHome = process.env.XDG_CONFIG_HOME || path.join(os.homedir(), ".config");
+    for (const base of [path.join(HARNESS, ".opencode"), path.join(configHome, "opencode")]) {
+      const dir = path.join(base, "node_modules", "@opencode-ai", "plugin");
+      try {
+        const pkg = JSON.parse(fs.readFileSync(path.join(dir, "package.json"), "utf8"));
+        const entry = pkg.exports?.["."]?.import ?? pkg.module ?? pkg.main ?? "index.js";
+        return await import(pathToFileURL(path.join(dir, entry)).href);
+      } catch {}
+    }
+    throw err;
+  }
+}
+
 export const server = async ({ directory }) => {
   const F = resolveFusion(directory);
   const {
@@ -999,7 +1020,7 @@ export const server = async ({ directory }) => {
     listInbox, stallsSummary, appendUsage, banner, printBanner,
     escalateImpl, workOrderImpl, localSummarize, effortFor,
   } = F;
-  const { tool } = await import("@opencode-ai/plugin");
+  const { tool } = await importPluginSdk();
 
   // Track which agent owns a session so tool-output compression only fires
   // for the paid tiers. tool.execute.after does not carry the agent itself.

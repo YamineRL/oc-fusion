@@ -444,7 +444,7 @@ agent.
   `cargo install --git https://github.com/rtk-ai/rtk`, or a prebuilt
   release binary). `oc-fusion doctor` reports it and nags until present.
 - **How it runs**: the vendored plugin
-  `.opencode/plugin/rtk.ts` (from rtk's own `rtk init -g --opencode`)
+  `plugins/rtk/index.ts` (from rtk's own `rtk init -g --opencode`)
   rewrites each Bash command via `rtk rewrite` before execution. No rtk in
   PATH → the plugin disables itself and commands run unchanged; a failed
   rewrite passes through. Nothing is written into your global config.
@@ -537,9 +537,9 @@ merely opening a session wakes the GPU to name a chat.
 fusion.jsonc               the control panel
 opencode.jsonc             providers, local aliases, agent definitions
 prompts/*.md               the five role prompts
-.opencode/plugin/fusion.js routing, the guard, effort injection, compression,
+plugins/fusion/index.js    routing, the guard, effort injection, compression,
                            discovery, accounting
-.opencode/plugin/rtk.ts    vendored rtk output-compression plugin (Bash rewrite)
+plugins/rtk/index.ts       vendored rtk output-compression plugin (Bash rewrite)
 bin/oc                     entry point
 bin/oc-fusion              panel CLI + doctor + usage + graft forwarder
 examples/llama-server.service  example local-server unit

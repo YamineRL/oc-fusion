@@ -15,7 +15,7 @@ import {
   validateWorkOrder,
   renderResultEnvelope,
   renderControllerState,
-} from "../.opencode/plugin/controller-lib.mjs";
+} from "../plugins/fusion/controller-lib.mjs";
 
 test("normalizeCommand collapses whitespace", () => {
   assert.equal(normalizeCommand("  npm   test \n --watch  "), "npm test --watch");

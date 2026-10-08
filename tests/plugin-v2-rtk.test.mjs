@@ -16,7 +16,7 @@ const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "rtk-v2-"));
 // Load through Node's TS loader the way the v2 runtime does.
 process.env.NODE_OPTIONS = `${process.env.NODE_OPTIONS ?? ""} --experimental-strip-types`;
 
-const mod = await import("../.opencode/plugin/rtk.ts").catch(() => import("../.opencode/plugin/rtk.ts"));
+const mod = await import("../plugins/rtk/index.ts").catch(() => import("../plugins/rtk/index.ts"));
 
 function fakeCtx(dir) {
   const hooks = new Map();
