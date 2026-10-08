@@ -1,0 +1,238 @@
+#!/usr/bin/env python3
+"""Keep opencode's background server in step with the harness.
+
+opencode v2 runs one detached `opencode serve --service` per user, and every
+TUI attaches to it. That server keeps the OPENCODE_CONFIG it was started
+with, and the plugins and config it loaded, for its whole life. A server
+started from another checkout, or before a config or plugin edit, keeps
+serving the old harness: on 2026-10-08 one dropped the fusion and rtk
+plugins for a whole day and logged only a warning.
+
+  oc-server check  [dir]   report; exit 1 when something is wrong
+  oc-server ensure [dir]   used by `oc` before it starts opencode:
+                           - stale server and no session running: restart it
+                           - stale server with a session running: leave it,
+                             print "standalone" so `oc` runs a private server
+                           - then confirm fusion and rtk loaded for [dir]
+
+Reads only: service.json, the server's process table entry, GET
+/api/session/active and GET /api/plugin. The only write is `opencode service
+restart`, and only when no session is running. Never fails the launch: any
+error prints a warning and exits 0 in ensure mode.
+"""
+import base64
+import json
+import os
+import subprocess
+import sys
+import time
+import urllib.request
+from pathlib import Path
+
+HARNESS = Path(__file__).resolve().parent.parent
+WANT_CONFIG = os.environ.get("OPENCODE_CONFIG") or str(HARNESS / "opencode.jsonc")
+WANT_PLUGINS = ("fusion", "rtk")
+
+
+def say(msg):
+    print(f"oc: {msg}", file=sys.stderr)
+
+
+def state_dir():
+    base = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
+    return Path(base) / "opencode"
+
+
+def service():
+    """{url, pid, password} from service.json, or None when there is none."""
+    try:
+        d = json.loads((state_dir() / "service.json").read_text())
+        return d if d.get("url") and d.get("pid") else None
+    except (OSError, ValueError):
+        return None
+
+
+def alive(pid):
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def api(svc, path, params=None):
+    url = svc["url"].rstrip("/") + path
+    if params:
+        url += "?" + "&".join(
+            f"{urllib.request.quote(k)}={urllib.request.quote(v)}" for k, v in params.items())
+    req = urllib.request.Request(url)
+    if svc.get("password"):
+        tok = base64.b64encode(f"opencode:{svc['password']}".encode()).decode()
+        req.add_header("Authorization", f"Basic {tok}")
+    with urllib.request.urlopen(req, timeout=float(os.environ.get("OC_SERVER_TIMEOUT", "8"))) as r:
+        return json.load(r)
+
+
+def server_env(pid, key):
+    """One environment variable of the server process: Linux /proc, else
+    `ps eww` (macOS shows the environment of your own processes)."""
+    try:
+        raw = Path(f"/proc/{pid}/environ").read_bytes()
+        for item in raw.split(b"\0"):
+            if item.startswith(key.encode() + b"="):
+                return item.split(b"=", 1)[1].decode()
+        return ""
+    except OSError:
+        pass
+    try:
+        out = subprocess.run(["ps", "eww", "-o", "command=", "-p", str(pid)],
+                             capture_output=True, text=True, timeout=3).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    for tok in out.split():
+        if tok.startswith(key + "="):
+            return tok.split("=", 1)[1]
+    return "" if out.strip() else None
+
+
+def server_started(pid):
+    """Server start time (epoch seconds), or None."""
+    try:
+        out = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True,
+                             text=True, timeout=3, env={**os.environ, "LC_ALL": "C"}).stdout.strip()
+        return time.mktime(time.strptime(" ".join(out.split()), "%a %b %d %H:%M:%S %Y"))
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+def watched_files(directory):
+    """Files a server reads at start or at first use of a project."""
+    cfg_home = Path(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")) / "opencode"
+    files = [Path(WANT_CONFIG), HARNESS / "fusion.jsonc",
+             cfg_home / "opencode.json", cfg_home / "opencode.jsonc"]
+    if os.environ.get("FUSION_PROFILE"):
+        files.append(Path(os.environ["FUSION_PROFILE"]))
+    for root in (HARNESS / "plugins", HARNESS / "prompts", cfg_home / "plugins"):
+        if root.is_dir():
+            files += [p for p in root.rglob("*") if p.is_file() and "node_modules" not in p.parts]
+    d = Path(directory)
+    files += [d / "fusion.jsonc", d / "opencode.json", d / "opencode.jsonc"]
+    return [f for f in files if f.is_file()]
+
+
+def stale_reasons(svc, directory):
+    pid = svc["pid"]
+    reasons = []
+    cfg = server_env(pid, "OPENCODE_CONFIG")
+    if cfg is not None and os.path.realpath(cfg or "/") != os.path.realpath(WANT_CONFIG):
+        reasons.append(f"it uses OPENCODE_CONFIG={cfg or '(none)'}, not {WANT_CONFIG}")
+    started = server_started(pid)
+    if started is not None:
+        newer = [f for f in watched_files(directory) if f.stat().st_mtime > started + 2]
+        if newer:
+            newest = max(newer, key=lambda f: f.stat().st_mtime)
+            more = f" and {len(newer) - 1} more" if len(newer) > 1 else ""
+            reasons.append(f"{newest}{more} changed after it started "
+                           f"({time.strftime('%H:%M', time.localtime(started))})")
+    return reasons
+
+
+def running_sessions(svc):
+    return [k for k, v in (api(svc, "/api/session/active").get("data") or {}).items()
+            if (v or {}).get("type") != "idle"]
+
+
+def plugin_states(svc, directory):
+    data = api(svc, "/api/plugin", {"location[directory]": directory}).get("data") or []
+    return {p.get("id"): (p.get("state") or {}).get("status") for p in data}
+
+
+def plugin_problems(svc, directory):
+    # The first request for a project starts its plugin load in the
+    # background and answers before it ends, so a missing entry right after
+    # a restart is normal. Wait a few seconds for it before reporting.
+    deadline = time.time() + float(os.environ.get("OC_SERVER_PLUGIN_WAIT", "10"))
+    states = plugin_states(svc, directory)
+    while any(n not in states for n in WANT_PLUGINS) and time.time() < deadline:
+        time.sleep(0.5)
+        states = plugin_states(svc, directory)
+    return [f"{name}: {states.get(name, 'not loaded')}"
+            for name in WANT_PLUGINS if states.get(name) != "active"]
+
+
+def restart():
+    r = subprocess.run(["opencode", "service", "restart"], capture_output=True, text=True,
+                       timeout=60, env={**os.environ, "OPENCODE_CONFIG": WANT_CONFIG})
+    if r.returncode != 0:
+        raise RuntimeError((r.stderr or r.stdout).strip()[:300] or f"exit {r.returncode}")
+
+
+def check(directory):
+    svc = service()
+    if not svc or not alive(svc["pid"]):
+        print("server    none running; the next `oc` starts one with this harness.")
+        return 0
+    print(f"server    pid {svc['pid']} at {svc['url']}")
+    bad = 0
+    for r in stale_reasons(svc, directory):
+        print(f"  WARN: stale: {r}.")
+        bad = 1
+    try:
+        busy = running_sessions(svc)
+        print(f"  sessions running: {len(busy)}")
+        probs = plugin_problems(svc, directory)
+    except Exception as e:  # noqa: BLE001
+        print(f"  WARN: server API did not answer: {e}")
+        return 1
+    if probs:
+        print(f"  WARN: plugins for {directory}: {', '.join(probs)}")
+        bad = 1
+    else:
+        print(f"  ok: {' and '.join(WANT_PLUGINS)} active for {directory}")
+    if bad:
+        print("  fix: quit every opencode window, then run `oc` (it restarts an idle server).")
+    return bad
+
+
+def ensure(directory):
+    svc = service()
+    if not svc or not alive(svc["pid"]):
+        return 0  # opencode starts a fresh server with our environment
+    reasons = stale_reasons(svc, directory)
+    if reasons:
+        busy = running_sessions(svc)
+        if busy:
+            say(f"the background server is stale ({'; '.join(reasons)}).")
+            say(f"{len(busy)} session(s) still run on it, so it stays up. This window uses a")
+            say("private server with the current harness. Quit the other windows to fix it for all.")
+            print("standalone")
+            return 0
+        say(f"restarting the idle background server: {'; '.join(reasons)}.")
+        restart()
+        svc = service()
+        if not svc:
+            return 0
+    probs = plugin_problems(svc, directory)
+    if probs:
+        say(f"WARNING: harness plugins not active here ({', '.join(probs)}).")
+        say("Fusion routing, effort limits and rtk are OFF in this session. Run `oc-fusion doctor`.")
+    return 0
+
+
+def main(argv):
+    mode = argv[1] if len(argv) > 1 else "check"
+    directory = os.path.realpath(argv[2] if len(argv) > 2 else os.getcwd())
+    if mode == "check":
+        return check(directory)
+    if mode == "ensure":
+        try:
+            return ensure(directory)
+        except Exception as e:  # noqa: BLE001 - never block the launch
+            say(f"server check skipped: {e}")
+            return 0
+    print(__doc__.strip(), file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

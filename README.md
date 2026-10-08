@@ -240,6 +240,23 @@ The control panel is resolved in this order: `$FUSION_PROFILE`, then a
 lead and sidekick), then the harness's own. Running plain `opencode` inside
 the harness directory also works, because opencode reads `./opencode.jsonc`.
 
+### The background server
+
+opencode v2 attaches every window to one background server
+(`opencode serve --service`). That server keeps the config and plugins it
+started with. A server started from another checkout, or before a config
+or plugin edit, keeps the old harness, and opencode only logs a warning.
+
+Before the TUI and `oc run`, `oc` runs `bin/oc-server ensure`:
+
+- stale server, no session running: restart it with this harness.
+- stale server, a session running: keep it, and start this window on a
+  private server (`--standalone`) with this harness.
+- then warn if the fusion or rtk plugin is not active in this project.
+
+`oc-fusion doctor` shows the same report (`bin/oc-server check`).
+`OC_NO_SERVER_CHECK=1 oc` skips the check.
+
 ## The control panel
 
 Edit `fusion.jsonc`, or use the CLI:

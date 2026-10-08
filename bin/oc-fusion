@@ -42,7 +42,8 @@ s = pat.sub(lambda m: f"{m.group(1)}{new}{m.group(2)}{m.group(3)}", s, count=1)
 open(path, "w").write(s)
 PY
   echo "oc-fusion: $key = $val"
-  echo "oc-fusion: restart opencode to apply."
+  echo "oc-fusion: quit opencode, then start \`oc\` again to apply. (\`oc\` restarts the"
+  echo "           background server once no session runs on it; closing a window alone does not.)"
 }
 
 get_key() {
@@ -548,6 +549,11 @@ except Exception: pass' 2>/dev/null)
       echo "rtk       $(rtk --version 2>/dev/null || echo installed)"
     else
       echo "rtk       MISSING: brew install rtk (or cargo install --git https://github.com/rtk-ai/rtk)"
+    fi
+    # The opencode v2 background server: started from this harness, newer
+    # than every config and plugin file, and fusion and rtk active here.
+    if command -v python3 >/dev/null; then
+      OPENCODE_CONFIG="${OPENCODE_CONFIG:-$ROOT/opencode.jsonc}" python3 "$ROOT/bin/oc-server" check "$PWD" || true
     fi
     ;;
   usage)
