@@ -13,6 +13,13 @@
 // one mid-generation. Every local alias therefore sends the same wire id, and
 // the guard below refuses (or warns about) anything else.
 //
+// Discovery follows the machine. With a systemd unit the unit is parsed for
+// flags and `ps` finds the resident model. Without one (macOS, or a server
+// on another host reached over a tunnel), or when FUSION_BASE_URL is set,
+// the endpoint itself answers: /v1/models for residency, /props for the
+// context, panel keys for the rest. All passive GETs, so none can trigger
+// a load.
+//
 // Dual plugin shape: OpenCode v2 calls `default.setup(context)`; v1 hosts
 // call `default.server(input)` (detect mode) or the named `server` export
 // (iterating loaders). Both bodies share `resolveFusion(directory)` below so
@@ -133,6 +140,15 @@ const DEFAULTS = {
   // rather than falling back, so adjust to your model.
   local_efforts: { scout: "low", grunt: "medium", critic: "high" },
 
+  // Remote llama.cpp only (no systemd unit, or FUSION_BASE_URL set): what
+  // HTTP cannot report. local_ctx is the server's TOTAL context (null =
+  // read the per-slot context from GET /props), local_parallel its
+  // --parallel, server_effort the fallback reasoning_effort for local
+  // agents missing from local_efforts.
+  local_ctx: null,
+  local_parallel: null,
+  server_effort: null,
+
   // Evidence routing. The runtime measures stalls and scope instead of asking
   // the lead to estimate hardness, and keeps the counters in plugin memory +
   // .fusion/control.jsonl so compaction cannot prune them away.
@@ -205,6 +221,20 @@ function readProfile(dir) {
   return { ...DEFAULTS };
 }
 
+// The config files opencode could have loaded, in precedence order: the
+// project first, then the file OPENCODE_CONFIG names (the harness config
+// when run through `oc`), then the global config.
+function configCandidates(directory) {
+  const home = os.homedir();
+  return [
+    path.join(directory, "opencode.json"),
+    path.join(directory, "opencode.jsonc"),
+    ...(process.env.OPENCODE_CONFIG ? [process.env.OPENCODE_CONFIG] : []),
+    path.join(home, ".config", "opencode", "opencode.json"),
+    path.join(home, ".config", "opencode", "opencode.jsonc"),
+  ];
+}
+
 // Registry id -> declared wire id for one provider's models, read straight
 // from the opencode config files. A plugin's model transform cannot ask the
 // registry for this: transforms replay in registration order on a fresh
@@ -212,13 +242,7 @@ function readProfile(dir) {
 // plugins, so the model map is always empty when a file plugin's transform
 // runs. The project config wins over the global one.
 function readConfigWireIds(directory, providerID) {
-  const home = os.homedir();
-  const candidates = [
-    path.join(directory, "opencode.json"),
-    path.join(directory, "opencode.jsonc"),
-    path.join(home, ".config", "opencode", "opencode.json"),
-    path.join(home, ".config", "opencode", "opencode.jsonc"),
-  ];
+  const candidates = configCandidates(directory);
   const wire = new Map();
   for (const p of candidates) {
     try {
@@ -230,6 +254,20 @@ function readConfigWireIds(directory, providerID) {
     } catch { /* absent or unparsable config is not a plugin problem */ }
   }
   return wire;
+}
+
+// One provider's configured baseURL, from the same config files. Remote
+// mode needs it: with no unit to parse, the endpoint is the only place the
+// server's address is written down.
+function readConfigBaseURL(directory, providerID) {
+  for (const p of configCandidates(directory)) {
+    try {
+      const cfg = JSON.parse(stripJsonc(fs.readFileSync(p, "utf8")));
+      const u = cfg?.provider?.[providerID]?.options?.baseURL;
+      if (u) return String(u);
+    } catch { /* absent or unparsable config is not a plugin problem */ }
+  }
+  return null;
 }
 
 // Key files are one key per line; # lines are comments. Take the first usable
@@ -335,14 +373,99 @@ function residentModels() {
   }
 }
 
+// ------------------------------------------- remote endpoint as source of truth
+
+// Remote mode: no systemd unit exists to parse (the server runs on another
+// host, or FUSION_BASE_URL names it directly). Everything the unit used to
+// tell us then comes from the endpoint and the panel: the port from the
+// base URL, ctx/parallel from the panel keys (GET /props fills what they
+// leave null), the effort fallback from "server_effort".
+function readEndpointConfig(profile, baseURL) {
+  const out = { ctx: null, port: null, modelsDir: null, modelsMax: null, parallel: null, effort: null, idle: null };
+  const m = String(baseURL ?? "").match(/:(\d+)/);
+  if (m) out.port = Number(m[1]);
+  if (profile?.local_ctx) out.ctx = Number(profile.local_ctx) || null;
+  if (profile?.local_parallel) out.parallel = Number(profile.local_parallel) || null;
+  if (profile?.server_effort) out.effort = profile.server_effort;
+  return out;
+}
+
+async function fetchJson(url, key, timeoutMs = 4000) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, {
+      headers: key ? { Authorization: `Bearer ${key}` } : {},
+      signal: ctrl.signal,
+    });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// The resident model(s) on a remote llama-server, read passively:
+// GET /v1/models only, never a completion, so it cannot trigger a load.
+// Router-mode servers report status.value per model ("loaded" | "unloaded"
+// | ...) plus the child server's args; a vanilla server lists only what it
+// has loaded, so a bare entry counts as resident.
+async function remoteResidentModels(baseURL, key) {
+  const found = new Map();
+  const origin = String(baseURL ?? "").replace(/\/v1\/?$/, "");
+  if (!origin) return found;
+  const doc = await fetchJson(`${origin}/v1/models`, key);
+  for (const m of doc?.data ?? []) {
+    if (!m?.id) continue;
+    const status = m.status?.value ? String(m.status.value).toLowerCase() : null;
+    if (status && !["loaded", "loading", "ready", "sleeping"].includes(status)) continue;
+    // Child-server args are a flat argv list; pull --ctx-size/--parallel out.
+    const args = Array.isArray(m.status?.args) ? m.status.args : [];
+    const flag = (f) => {
+      const i = args.indexOf(f);
+      return i >= 0 && i + 1 < args.length ? Number(args[i + 1]) || null : null;
+    };
+    found.set(String(m.id), { ctx: flag("--ctx-size"), parallel: flag("--parallel") });
+  }
+  return found;
+}
+
 // ------------------------------------------------- shared setup (both hosts)
 
 // Everything the two plugin bodies need that does not depend on the host's
 // hook API: profile resolution, local-server discovery, controller state,
 // graft helpers, work orders, the escalate/summarize machinery, the banner.
-function resolveFusion(directory) {
+async function resolveFusion(directory) {
   const profile = readProfile(directory);
-  const unit = readUnit();
+
+  // Where llama-server lives decides how it is discovered. With a systemd
+  // unit the unit is the contract. Without one (macOS, a remote box reached
+  // over a tunnel), or when FUSION_BASE_URL is set, the endpoint answers:
+  // /v1/models for residency, /props for the context, the panel keys for
+  // the rest. All passive GETs; none names a model, so none can load one.
+  const forcedBase = process.env.FUSION_BASE_URL || null;
+  const remote = Boolean(forcedBase) || !fs.existsSync(UNIT);
+  const llamaBase = remote ? forcedBase ?? readConfigBaseURL(directory, "llamacpp") : null;
+  const llamaOrigin = llamaBase ? llamaBase.replace(/\/v1\/?$/, "") : null;
+  const unit = remote ? readEndpointConfig(profile, llamaBase) : readUnit();
+
+  let llamaKey = null;
+  if (remote) {
+    try { llamaKey = readKeyFile(API_KEY_FILE); } catch { /* absent key: probes below just fail closed */ }
+  }
+  const resident = remote ? await remoteResidentModels(llamaBase, llamaKey) : residentModels();
+  // /props reports the per-slot context and the slot count; use it for what
+  // the panel left null. ctx stays a TOTAL so the per-slot clamp below
+  // divides the same way as with a unit.
+  if (remote && llamaOrigin && (unit.ctx == null || unit.parallel == null)) {
+    const props = await fetchJson(`${llamaOrigin}/props`, llamaKey);
+    const slotCtx = props?.default_generation_settings?.n_ctx_slot ?? props?.n_ctx_slot ?? null;
+    const slots = Number(props?.total_slots) || null;
+    if (unit.ctx == null && slotCtx) unit.ctx = slotCtx * (slots || 1);
+    if (unit.parallel == null) unit.parallel = slots;
+  }
 
   const base = BASES[profile.base] ?? BASES[DEFAULTS.base];
   if (!BASES[profile.base]) {
@@ -396,7 +519,6 @@ function resolveFusion(directory) {
     return fast && String(agent) === "scout" ? "low" : asked;
   }
 
-  const resident = residentModels();
   // The wire id every local alias sends: pinned via the panel, else whatever
   // the running server has resident. Discovery means the harness cannot ask
   // the server for a model it does not have loaded.
@@ -669,7 +791,11 @@ function resolveFusion(directory) {
       );
     }
     if (unit.ctx && usesLlama) {
-      console.error(`[fusion] llama-server unit: ctx ${unit.ctx}, parallel ${unit.parallel}, models-max ${unit.modelsMax}, idle-sleep ${unit.idle}s`);
+      console.error(
+        remote
+          ? `[fusion] llama-server endpoint ${llamaBase}: ctx ${unit.ctx}, parallel ${unit.parallel ?? "?"}`
+          : `[fusion] llama-server unit: ctx ${unit.ctx}, parallel ${unit.parallel}, models-max ${unit.modelsMax}, idle-sleep ${unit.idle}s`,
+      );
     }
     if (sidekickIsLlama && resident.size && !resident.has(localWireId)) {
       console.error(`[fusion] WARNING: sidekick wants "${localWireId}" but resident is "${[...resident.keys()].join(", ")}". First sidekick call will evict it.`);
@@ -930,7 +1056,10 @@ function resolveFusion(directory) {
       // the alias cannot evict anything.
       model = sidekick.slice(sidekick.indexOf("/") + 1);
     } else {
-      base = `http://127.0.0.1:${unit.port ?? 8080}`;
+      base = remote ? llamaOrigin : `http://127.0.0.1:${unit.port ?? 8080}`;
+      if (!base) {
+        throw new Error("no llama-server endpoint: no unit, no FUSION_BASE_URL, no provider.llamacpp baseURL");
+      }
       key = readKeyFile(API_KEY_FILE);
       // Same rule as the wire stamp: a load-time name can be stale, so the
       // resident model is re-read here. A bad read means no summarizer call.
@@ -973,7 +1102,8 @@ function resolveFusion(directory) {
   }
 
   return {
-    profile, unit, base, oracleBase, oracleEffort, fast, leadEffort, leadModel,
+    profile, unit, remote, llamaBase, llamaOrigin,
+    base, oracleBase, oracleEffort, fast, leadEffort, leadModel,
     sidekick, sidekickIsLocal, sidekickIsLlama, criticPatch, resident, localWireId, localRuntime,
     cfgWireIds, readResidentLive, pickWireId, effortFor,
     ctrl, fusionDir, controlLog, ordersFile, inboxDir, outboxDir,
@@ -1011,7 +1141,7 @@ async function importPluginSdk() {
 }
 
 export const server = async ({ directory }) => {
-  const F = resolveFusion(directory);
+  const F = await resolveFusion(directory);
   const {
     profile, unit, oracleBase, oracleEffort, fast, leadEffort, leadModel,
     sidekick, sidekickIsLocal, sidekickIsLlama, criticPatch, resident, localWireId, localRuntime,
@@ -1509,9 +1639,9 @@ export const server = async ({ directory }) => {
 
 const setupV2 = async (ctx) => {
   const directory = ctx.location.directory;
-  const F = resolveFusion(directory);
+  const F = await resolveFusion(directory);
   const {
-    profile, unit, oracleBase, oracleEffort, fast, leadEffort, leadModel,
+    profile, unit, remote, llamaBase, oracleBase, oracleEffort, fast, leadEffort, leadModel,
     sidekick, sidekickIsLocal, sidekickIsLlama, criticPatch, resident, localWireId, localRuntime,
     cfgWireIds, readResidentLive, pickWireId, effortFor,
     ctrl, inboxDir, outboxDir, logControl, graftBin, hasGraft, fileScope,
@@ -1801,7 +1931,7 @@ const setupV2 = async (ctx) => {
   // resident id, and only a genuinely non-resident name is a violation.
   registrations.push(await ctx.session.hook("model.request", async (event) => {
     if (profile.guard === "off") return;
-    const baseURL = event.baseURL ?? `http://127.0.0.1:${unit.port ?? 8080}`;
+    const baseURL = event.baseURL ?? llamaBase ?? `http://127.0.0.1:${unit.port ?? 8080}`;
     const ids = await readResidentLive(baseURL, event.headers);
     const residentList = ids && ids.size ? [...ids].join(", ") : "none";
     if (!ids || !ids.size) {

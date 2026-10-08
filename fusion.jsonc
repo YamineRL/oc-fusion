@@ -58,6 +58,26 @@
   // only: Strata serves one model, answers any name, ignores this knob.
   "local_model": null,
 
+  // Remote llama.cpp. Read only when no systemd unit exists (the server
+  // runs on another host, reached over a tunnel) or FUSION_BASE_URL is
+  // set. The base URL then comes from FUSION_BASE_URL, else
+  // provider.llamacpp.options.baseURL, and these keys fill what HTTP
+  // cannot say:
+  //   local_ctx       the server's TOTAL -c context (null = read the
+  //                   per-slot context from GET /props)
+  //   local_parallel  the server's --parallel (null = /props total_slots)
+  //   server_effort   fallback reasoning_effort for local agents missing
+  //                   from local_efforts (null = medium)
+  "local_ctx": null,
+  "local_parallel": null,
+  "server_effort": null,
+
+  // Opt-in remote Strata swap, off by default. When set to an ssh
+  // destination, `oc-fusion sidekick strata|strata-coder` first runs
+  // `strata-use iq3|coder` on that host so the remote Strata serves the
+  // model the alias expects. null never touches the network.
+  "strata_remote_swap": null,
+
   // reasoning_effort injected per local agent (chat-template levels; a
   // template throws on one it does not know, so adjust to your model).
   // Applies to both local providers. Delete an entry to fall back to the

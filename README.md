@@ -227,6 +227,14 @@ fish_add_path /path/to/oc-fusion/bin   # fish, once; then `oc` and `oc-fusion` w
 echo 'export PATH="/path/to/oc-fusion/bin:$PATH"' >> ~/.bashrc   # bash, once; then restart your shell
 ```
 
+fish 4.x ships a built-in `oc.fish` for OpenShift's `oc` that runs
+`oc completion fish | source`, which prints opencode's help and floods
+errors. `examples/oc.fish` overrides it so `oc` completes like `opencode`:
+
+```fish
+cp /path/to/oc-fusion/examples/oc.fish ~/.config/fish/completions/oc.fish
+```
+
 The control panel is resolved in this order: `$FUSION_PROFILE`, then a
 `fusion.jsonc` in the project you are working in (so a repo can pin its own
 lead and sidekick), then the harness's own. Running plain `opencode` inside
@@ -280,6 +288,40 @@ The model size depends on RAM and VRAM together. RAM decides which sizes
 fit, VRAM decides the speed, the default context, and what runs in Strata's
 low-RAM mode on a 32 GB PC. Option B above applies the rules from Strata's
 README and [docs/MODELS.md](https://github.com/Niko1221/Strata/blob/main/docs/MODELS.md).
+
+One Strata server flag matters here: set `"fit_max_tokens": true` in the
+model's `strata-<model>.json` (or pass `--fit-max-tokens`). Without it,
+opencode can ask for more output tokens than the context has left and
+Strata answers 400 ("requests are never truncated"); with it, Strata
+shortens `max_tokens` to the room left. Strata reads it only at start, so
+restart the server after changing it.
+
+## Running from another machine
+
+The harness works on a client machine with no local GPU, for example a
+laptop whose llama-server and Strata both run on a remote host, reached
+over an SSH tunnel that forwards the ports to localhost. Nothing to install
+beyond the tunnel: set the two `baseURL` values in `opencode.jsonc` to the
+forwarded endpoints (`provider.llamacpp.options.baseURL` and
+`provider.strata.options.baseURL`), and put the two key files in their
+usual places
+(`~/.config/llama-server/api-key`, `~/.config/strata/api-key`).
+
+- **No systemd unit needed.** When the unit file is absent, or
+  `FUSION_BASE_URL` is set, the plugin discovers the llama.cpp server over
+  HTTP instead: `/v1/models` for the resident model, `/props` for the
+  context, passively, so discovery can never trigger a load. The panel keys
+  `local_ctx`, `local_parallel` and `server_effort` in `fusion.jsonc` fill
+  what HTTP cannot report; `oc-fusion doctor` checks the endpoint the same
+  way. `FUSION_BASE_URL` overrides the llamacpp `baseURL` when your tunnel
+  lands on a different port.
+- **Remote Strata swap is opt-in.** `oc-fusion sidekick strata` /
+  `strata-coder` can ask the remote host to serve the matching model first:
+  set `"strata_remote_swap"` in `fusion.jsonc` to an ssh destination and
+  the switch runs `strata-use iq3|coder` there before changing the panel.
+  Leave it `null` (the default) to swap Strata by hand.
+- **graft** stays offline-wrapped: `sandbox-exec` on macOS, `unshare` on
+  Linux. `oc-fusion doctor` reports which isolation it found.
 
 ## Your local server is the source of truth
 
