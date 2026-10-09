@@ -94,8 +94,10 @@ def api(svc, path, params=None):
 
 
 def server_env(pid, key):
-    """One environment variable of the server process: Linux /proc, else
-    `ps eww` (macOS shows the environment of your own processes)."""
+    """One environment variable of the server process, "" when it is not
+    set, None when the environment cannot be read. Linux: /proc. Else `ps
+    eww`, but macOS 27 prints no environment there at all, so an output
+    without PATH= means unknown, not unset: else every server looks stale."""
     try:
         raw = Path(f"/proc/{pid}/environ").read_bytes()
         for item in raw.split(b"\0"):
@@ -109,10 +111,13 @@ def server_env(pid, key):
                              capture_output=True, text=True, timeout=3).stdout
     except (OSError, subprocess.SubprocessError):
         return None
-    for tok in out.split():
+    toks = out.split()
+    if not any(t.startswith("PATH=") for t in toks):
+        return None
+    for tok in toks:
         if tok.startswith(key + "="):
             return tok.split("=", 1)[1]
-    return "" if out.strip() else None
+    return ""
 
 
 def server_started(pid):

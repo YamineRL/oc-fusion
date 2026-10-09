@@ -95,6 +95,14 @@ function makeWorld() {
   return { root, project, marker, env, writeService, run };
 }
 
+// Stale on every OS: the harness config changed after the server started.
+// The env mismatch alone works only on Linux, because macOS hides another
+// process's environment and oc-server then treats the config as unknown.
+const editConfigAfterStart = (w) => {
+  const later = Date.now() / 1000 + 60;
+  fs.utimesSync(w.env.OPENCODE_CONFIG, later, later);
+};
+
 const PLUGINS_OK = [
   { id: "fusion", state: { status: "active" } },
   { id: "rtk", state: { status: "active" } },
@@ -114,6 +122,7 @@ test("ensure: stale but busy server stays up, prints standalone, queues a notice
     plugins: PLUGINS_OK,
     env: { OPENCODE_CONFIG: "/definitely/other/config.jsonc" }, // env mismatch = stale
   });
+  editConfigAfterStart(w);
   w.writeService({ url: `http://127.0.0.1:${srv.port}`, pid: srv.pid });
   try {
     const r = w.run(["ensure"]);
@@ -136,6 +145,7 @@ test("ensure: stale and idle restarts the server, then verifies plugins", async 
     plugins: PLUGINS_OK,
     env: { OPENCODE_CONFIG: "/definitely/other/config.jsonc" },
   });
+  editConfigAfterStart(w);
   w.writeService({ url: `http://127.0.0.1:${srv.port}`, pid: srv.pid });
   try {
     const r = w.run(["ensure"]);
