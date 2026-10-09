@@ -130,9 +130,12 @@ function fakeCtx(dir) {
   };
   const ctx = {
     location: { directory: dir },
-    agent: { transform: (cb) => { transforms.agent.push(cb); return Promise.resolve({ dispose() {} }); } },
-    model: { transform: (cb) => { transforms.model.push(cb); return Promise.resolve({ dispose() {} }); } },
+    agent: { transform: (cb) => { transforms.agent.push(cb); return Promise.resolve({ dispose() {} }); }, reload: async () => {} },
+    model: { transform: (cb) => { transforms.model.push(cb); return Promise.resolve({ dispose() {} }); }, reload: async () => {} },
     mcp: { transform: (cb) => { transforms.mcp.push(cb); return Promise.resolve({ dispose() {} }); } },
+    rpc: {
+      register: async () => ({ dispose() {}, events: { emit: async () => {} } }),
+    },
     tool: {
       transform: (cb) => { cb(toolEditor); return Promise.resolve({ dispose() {} }); },
       list: async () => [...tools.values()],

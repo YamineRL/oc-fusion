@@ -22,19 +22,31 @@
   "plugin": ["./plugins/fusion", "./plugins/rtk"],
 
   // Fusion's efficiency comes from fewer, fatter round trips.
+  //   batch_tool / primary_tools: v1-only. v2 batches through the built-in
+  //   codemode "execute" tool instead, and the primary_tools effect lives in
+  //   the per-agent permissions below (only the lead may spawn subagents or
+  //   call escalate/work_order). The keys stay because the Mac host is v1;
+  //   the plugin audits them so they are documented, not silently dead.
+  //   subagent_depth lives under experimental so BOTH hosts read it: v2
+  //   drops the top-level key but honors this one. Subagents must not spawn
+  //   subagents: on --parallel 1 that deadlocks the single local slot.
   "experimental": {
     "batch_tool": true,
-    "primary_tools": ["task", "escalate", "work_order"]
+    "primary_tools": ["task", "escalate", "work_order"],
+    "subagent_depth": 1
   },
-
-  // Subagents must not spawn subagents: on --parallel 1 that deadlocks the
-  // single local slot behind itself.
-  "subagent_depth": 1,
 
   "compaction": {
     "auto": true,
+    // v1 flag; v2 drops it, so the fusion plugin prunes stale tool outputs
+    // itself on v2 (see plugins/fusion). Keep it: same file serves v1.
     "prune": true,
+    // v1 keeps the last N turns verbatim; v2 counts TOKENS instead and reads
+    // preserve_recent_tokens (mapped to keep.tokens). Both keys stay: turns
+    // and tokens are not convertible, so this is an honest budget, not a
+    // translation. ~8 turns of chat ≈ 16000 tokens.
     "tail_turns": 8,
+    "preserve_recent_tokens": 16000,
     "reserved": 8000
   },
 
@@ -166,7 +178,9 @@
       "model": "merge-gateway/zai/glm-5.3",
       "variant": "high",
       "prompt": "{file:./prompts/fusion.md}",
-      "steps": 400,
+      // No "steps" here: under v2 a declared field beats the plugin's agent
+      // transform, and the plugin owns the step budget so /fusion speed
+      // (fast = 200, normal = 400) can change it without a restart.
       // The v2 runner gives an agent with no ruleset a deny-everything
       // default, so this block is load-bearing, not a nicety. Keep it in this
       // file rather than another config's agent map: a later config source's
@@ -191,6 +205,12 @@
       "permission": {
         "edit": "deny",
         "write": "deny",
+        // Lead-only tools (v1 primary_tools, v2 per-agent permissions):
+        // a sidekick seat may not spawn subagents, escalate or file orders.
+        "task": "deny",
+        "subagent": "deny",
+        "escalate": "deny",
+        "work_order": "deny",
         "bash": {
           "*": "deny",
           "git log*": "allow", "git diff*": "allow", "git show*": "allow",
@@ -220,7 +240,12 @@
         "*": "allow",
         "doom_loop": "deny",
         "external_directory": "ask",
-        "question": "allow"
+        "question": "allow",
+        // Lead-only tools: no nested subagents, no escalation, no orders.
+        "task": "deny",
+        "subagent": "deny",
+        "escalate": "deny",
+        "work_order": "deny"
       }
     },
     "oracle": {
@@ -230,14 +255,28 @@
       "variant": "max",
       "prompt": "{file:./prompts/oracle.md}",
       "steps": 40,
-      "permission": { "edit": "deny", "write": "deny" }
+      "permission": {
+        "edit": "deny",
+        "write": "deny",
+        "task": "deny",
+        "subagent": "deny",
+        "escalate": "deny",
+        "work_order": "deny"
+      }
     },
     "critic": {
       "description": "Reviews a diff for correctness before you call the work done.",
       "mode": "subagent",
       "prompt": "{file:./prompts/critic.md}",
       "steps": 40,
-      "permission": { "edit": "deny", "write": "deny" }
+      "permission": {
+        "edit": "deny",
+        "write": "deny",
+        "task": "deny",
+        "subagent": "deny",
+        "escalate": "deny",
+        "work_order": "deny"
+      }
     }
   }
 }

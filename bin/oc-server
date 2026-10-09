@@ -38,6 +38,26 @@ def say(msg):
     print(f"oc: {msg}", file=sys.stderr)
 
 
+def note(directory, kind, message, action="", severity="warning"):
+    """Queue one notice for the TUI. Launch-time findings go to a stderr a
+    TUI user never sees, so they are also dropped as one JSON line into
+    <project>/.fusion/pending-notices.jsonl, which the fusion plugin drains
+    into the toast surface. Best-effort: a launch never fails on this."""
+    try:
+        d = Path(directory) / ".fusion"
+        d.mkdir(parents=True, exist_ok=True)
+        with open(d / "pending-notices.jsonl", "a", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "kind": kind,
+                "severity": severity,
+                "title": "fusion",
+                "message": message,
+                "action": action,
+            }) + "\n")
+    except OSError:
+        pass
+
+
 def state_dir():
     base = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
     return Path(base) / "opencode"
@@ -205,6 +225,9 @@ def ensure(directory):
             say(f"the background server is stale ({'; '.join(reasons)}).")
             say(f"{len(busy)} session(s) still run on it, so it stays up. This window uses a")
             say("private server with the current harness. Quit the other windows to fix it for all.")
+            note(directory, "stale-server",
+                 f"The background opencode server is stale ({'; '.join(reasons)}).",
+                 "This window runs a private server with the current harness. Quit the other opencode windows to fix it for all.")
             print("standalone")
             return 0
         say(f"restarting the idle background server: {'; '.join(reasons)}.")
@@ -216,6 +239,10 @@ def ensure(directory):
     if probs:
         say(f"WARNING: harness plugins not active here ({', '.join(probs)}).")
         say("Fusion routing, effort limits and rtk are OFF in this session. Run `oc-fusion doctor`.")
+        note(directory, "plugin-inactive",
+             f"Harness plugins are not active on this server: {', '.join(probs)}.",
+             "Fusion routing, effort limits and rtk are off. Restart the server or run /fusion doctor.",
+             severity="error")
     return 0
 
 

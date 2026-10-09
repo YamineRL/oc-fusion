@@ -209,12 +209,34 @@ function fakeCtx(dir, seed = {}) {
     return Promise.resolve({ dispose: () => {} });
   };
 
+  // Registered RPC services: definition -> handlers, plus emitted events.
+  // Mirrors ctx.rpc.register on the real host.
+  const rpcServices = new Map();
+  const rpcEmitted = [];
+
   const ctx = {
     location: { directory: dir },
     options: {},
-    agent: { transform: (cb) => { transforms.agent.push(cb); return Promise.resolve({ dispose: () => {} }); } },
-    model: { transform: (cb) => { transforms.model.push(cb); return Promise.resolve({ dispose: () => {} }); } },
+    agent: {
+      transform: (cb) => { transforms.agent.push(cb); return Promise.resolve({ dispose: () => {} }); },
+      // The real host replays registered transforms on rebuild; the fake
+      // does the same for every domain.
+      reload: () => { rebuild(); return Promise.resolve(); },
+    },
+    model: {
+      transform: (cb) => { transforms.model.push(cb); return Promise.resolve({ dispose: () => {} }); },
+      reload: () => { rebuild(); return Promise.resolve(); },
+    },
     mcp: { transform: (cb) => { transforms.mcp.push(cb); return Promise.resolve({ dispose: () => {} }); } },
+    rpc: {
+      register: (definition, handlers) => {
+        rpcServices.set(definition.id, { definition, handlers });
+        return Promise.resolve({
+          dispose: () => {},
+          events: { emit: (name, data) => { rpcEmitted.push({ rpc: definition.id, name, data }); return Promise.resolve(); } },
+        });
+      },
+    },
     tool: {
       transform: (cb) => {
         cb(toolEditor(tools));
@@ -245,6 +267,11 @@ function fakeCtx(dir, seed = {}) {
     mcps,
     tools,
     hooks,
+    rpcServices,
+    rpcEmitted,
+    // Call a registered RPC method as the TUI client would.
+    rpc: (method, input, callCtx = { error: (type, message, data) => ({ __rpcError: true, type, message, data }) }) =>
+      rpcServices.get("fusion")?.handlers?.[method]?.(input ?? {}, callCtx),
     rebuild,
     emit: (ev) => (eventWaiters.length ? eventWaiters.shift()(ev) : eventQueue.push(ev)),
     fire: async (name, event) => {
@@ -295,7 +322,21 @@ const fetchOk = (ids) => async (url) => {
   if (!String(url).endsWith("/v1/models")) throw new Error(`unexpected fetch ${url}`);
   return { ok: true, status: 200, json: async () => ({ data: ids.map((id) => ({ id, status: { value: "loaded" } })) }) };
 };
+// Setup now probes the configured local backends (passive: /health and
+// /v1/models only). The default answers "up" so existing behavior is
+// deterministic; tests that want a down backend install their own stub.
+const healthyBackend = async (url) => {
+  const u = String(url);
+  if (u.endsWith("/health")) {
+    return { ok: true, status: 200, json: async () => ({ model: "qwen3.8-flash-next-iq3_xxs", max_context: 98304, loaded: true }) };
+  }
+  if (u.endsWith("/v1/models")) {
+    return { ok: true, status: 200, json: async () => ({ data: [{ id: "resident-x", status: { value: "loaded" } }] }) };
+  }
+  throw new Error(`unexpected fetch ${u}`);
+};
 const stubFetch = (handler) => { globalThis.fetch = handler; };
+test.beforeEach(() => { globalThis.fetch = healthyBackend; });
 test.afterEach(() => { globalThis.fetch = realFetch; });
 
 // ----------------------------------------------------------- setup shape
@@ -957,4 +998,204 @@ test("codemode shared callID: queued pendings resolve by kind and value", async 
   const checks = controlLines(dir).filter((l) => l.kind === "check");
   assert.equal(checks.length, 1);
   assert.equal(checks[0].cmd, "make check");
+});
+
+// ------------------------------------------------ backend health + fallback
+//
+// The fallback contract: a local backend that does not answer its passive
+// probe reroutes sidekick seats to sidekick_fallback, emits one notice, and
+// refuses retries aimed at it. When the probe starts answering again the
+// seats flip back and one "back up" notice lands. The health timer is the
+// trigger for the flip-back, so the test captures the interval callback
+// and ticks it instead of waiting 30s.
+
+const captureInterval = () => {
+  const real = globalThis.setInterval;
+  let tick = null;
+  globalThis.setInterval = (cb) => {
+    tick = cb;
+    return { unref() {} };
+  };
+  return { tick: () => tick, restore: () => { globalThis.setInterval = real; } };
+};
+
+const strataDown = async (url) => {
+  const u = String(url);
+  if (u.includes("18082")) throw new Error("connection refused");
+  return healthyBackend(url);
+};
+
+const noticeKinds = (h) => h.rpcEmitted.filter((e) => e.name === "notice").map((e) => e.data.kind);
+
+test("backend down: strata seats reroute to sidekick_fallback, one notice, retries refused", async () => {
+  stubFetch(strataDown);
+  const iv = captureInterval();
+  const dir = makeDir({ sidekick_fallback: "glm" }, defaultOpencodeCfg);
+  const h = fakeCtx(dir, { cfgAgents: repoAgentTable() });
+  await fusion.setup(h.ctx);
+  h.rebuild();
+  try {
+    // scout/grunt/critic moved to the fallback ref.
+    const fb = { providerID: "merge-gateway", id: "zai/glm-5.3-flash" };
+    assert.deepEqual(h.agents.get("scout").model, fb);
+    assert.deepEqual(h.agents.get("grunt").model, fb);
+    assert.deepEqual(h.agents.get("critic").model, fb);
+
+    // The down state is visible as a notice (backlog; it fired before the
+    // fake RPC service existed), never silently.
+    const { items } = await h.rpc("notices", {});
+    const down = items.find((n) => n.kind === "backend-down");
+    assert.ok(down, "no backend-down notice");
+    assert.match(down.message, /Strata/);
+    assert.match(down.action, /fallback/i);
+
+    // A retry aimed at the down backend is refused.
+    const retry = { model: { providerID: "strata", id: "strata-iq3" } };
+    await h.fireScoped("session:retry", retry);
+    assert.deepEqual(retry.decision, { retry: false });
+
+    // Recovery: the health tick re-probes, the seats flip back, one notice.
+    stubFetch(healthyBackend);
+    await iv.tick()();
+    await settle();
+    h.rebuild();
+    const ref = { providerID: "strata", id: "strata-iq3" };
+    assert.deepEqual(h.agents.get("scout").model, ref);
+    assert.ok(noticeKinds(h).includes("backend-up"), "no backend-up notice");
+    assert.equal(noticeKinds(h).filter((k) => k === "backend-up").length, 1);
+  } finally {
+    iv.restore();
+  }
+});
+
+test("backend down with no fallback: seats stay put and the notice says so", async () => {
+  stubFetch(strataDown);
+  const dir = makeDir({ sidekick_fallback: null }, defaultOpencodeCfg);
+  const h = fakeCtx(dir, { cfgAgents: repoAgentTable() });
+  await fusion.setup(h.ctx);
+  h.rebuild();
+
+  const ref = { providerID: "strata", id: "strata-iq3" };
+  assert.deepEqual(h.agents.get("scout").model, ref);
+  const { items } = await h.rpc("notices", {});
+  const down = items.find((n) => n.kind === "backend-down");
+  assert.ok(down);
+  assert.match(down.action, /sidekick_fallback/);
+});
+
+// ------------------------------------------------------------------- RPC
+
+test("fusion RPC: status, choices, set writes fusion.jsonc, notices drains the pending file", async () => {
+  // speed and local_efforts must exist in fusion.jsonc for `set` to write
+  // them: a missing key is a deliberate write-failed, not a silent add.
+  const dir = makeDir(
+    { sidekick: "strata", speed: "normal", local_efforts: { scout: "low" } },
+    defaultOpencodeCfg,
+  );
+  const h = fakeCtx(dir, { cfgAgents: repoAgentTable() });
+  await fusion.setup(h.ctx);
+
+  const st = await h.rpc("status", { sessionID: "s-rpc" });
+  assert.ok(st.banner);
+  assert.equal(st.profile.sidekick, "strata");
+  assert.equal(st.backend.strata.up, true);
+  assert.equal(st.backend.llamacpp.used, false);
+  assert.equal(st.session.id, "s-rpc");
+  assert.ok(Array.isArray(st.dropped.audited) && Array.isArray(st.dropped.unaudited));
+
+  const choices = await h.rpc("choices", { key: "sidekick" });
+  assert.ok(choices.options.length > 0);
+  assert.equal(choices.current, "strata");
+  const bad = await h.rpc("choices", { key: "nonsense" });
+  assert.ok(bad.error);
+
+  // set writes the profile key and live-reloads: speed fast drops the lead
+  // step budget on the next rebuild.
+  const set = await h.rpc("set", { key: "speed", value: "fast" });
+  assert.equal(set.applied, true);
+  const profile = JSON.parse(fs.readFileSync(path.join(dir, "fusion.jsonc"), "utf8"));
+  assert.equal(profile.speed, "fast");
+  h.rebuild();
+  assert.equal(h.agents.get("fusion").steps, 200);
+
+  const badSet = await h.rpc("set", { key: "speed", value: "ludicrous" });
+  assert.equal(badSet.__rpcError, true);
+  assert.equal(badSet.type, "bad-value");
+
+  const effortSet = await h.rpc("set", { key: "local_efforts.grunt", value: "xhigh" });
+  assert.equal(effortSet.applied, true);
+  const p2 = JSON.parse(fs.readFileSync(path.join(dir, "fusion.jsonc"), "utf8"));
+  assert.equal(p2.local_efforts.grunt, "xhigh");
+
+  // A notice bin/oc-server dropped on disk shows up in the backlog and the
+  // file is consumed.
+  fs.mkdirSync(path.join(dir, ".fusion"), { recursive: true });
+  const pending = path.join(dir, ".fusion", "pending-notices.jsonl");
+  fs.writeFileSync(pending, JSON.stringify({ kind: "stale-server", message: "the running server predates this checkout" }) + "\n");
+  const { items } = await h.rpc("notices", {});
+  assert.ok(items.some((n) => n.kind === "stale-server"));
+  assert.equal(fs.readFileSync(pending, "utf8"), "");
+});
+
+// ----------------------------------------------------------------- prune
+
+test("compaction.prune parity: the context hook shrinks stale tool outputs", async () => {
+  const dir = makeDir({}, {
+    ...defaultOpencodeCfg,
+    compaction: { prune: true },
+  });
+  const h = fakeCtx(dir);
+  await fusion.setup(h.ctx);
+
+  const messages = [
+    { role: "tool", content: [{ type: "tool-result", toolCallId: "a", result: { type: "text", value: "x".repeat(60000) } }] },
+    { role: "tool", content: [{ type: "tool-result", toolCallId: "b", result: { type: "error", value: "boom" } }] },
+    { role: "tool", content: [{ type: "tool-result", toolCallId: "c", result: { type: "text", value: "y".repeat(500) } }] },
+  ];
+  await h.fire("session:context", { sessionID: "s1", messages, options: {} });
+
+  assert.match(messages[0].content[0].result.value, /\[pruned \d+ characters\]$/);
+  assert.equal(messages[1].content[0].result.value, "boom");
+  assert.equal(messages[2].content[0].result.value.length, 500);
+});
+
+// --------------------------------------------------------- failure notices
+
+test("http.response notices: context 400 decoded once, other errors once each", async () => {
+  const dir = makeDir({ sidekick: "local" }, defaultOpencodeCfg);
+  const h = fakeCtx(dir);
+  await fusion.setup(h.ctx);
+
+  const respond = async (status, body) => {
+    const res = new Response(body, { status });
+    await h.fireScoped("session:http.response", {
+      sessionID: "s1",
+      agent: "grunt",
+      model: { providerID: "llamacpp", id: "resident-x" },
+      response: res,
+    });
+  };
+  await respond(400, "request exceeds the available context size");
+  await respond(400, "request exceeds the available context size");
+  await respond(500, "internal error");
+
+  const notices = h.rpcEmitted.filter((e) => e.name === "notice").map((e) => e.data);
+  assert.equal(notices.filter((n) => n.kind === "context-400").length, 1, "same 400 dedupes to one notice");
+  const err = notices.find((n) => n.kind === "backend-error");
+  assert.ok(err);
+  assert.match(err.message, /HTTP 500/);
+});
+
+test("a reply that ends on length with reasoning tokens gets a thinking-truncated notice", async () => {
+  const dir = makeDir({ sidekick: "local" }, defaultOpencodeCfg);
+  const h = fakeCtx(dir);
+  await fusion.setup(h.ctx);
+
+  h.emit({ type: "session.step.started", sessionID: "s7", assistantMessageID: "am9", agent: "grunt", model: { providerID: "llamacpp", id: "resident-x" } });
+  h.emit({ type: "session.step.ended", sessionID: "s7", assistantMessageID: "am9", finish: "length", cost: 0, tokens: { input: 10, output: 5, reasoning: 900 } });
+  for (let i = 0; i < 50 && !noticeKinds(h).length; i++) await settle();
+
+  const n = h.rpcEmitted.find((e) => e.data?.kind === "thinking-truncated");
+  assert.ok(n, "no thinking-truncated notice");
+  assert.match(n.data.action, /effort/i);
 });

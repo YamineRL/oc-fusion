@@ -149,5 +149,13 @@
 
   // Repo-relative prefixes sidekick seats may never edit regardless of
   // measurements, e.g. ["db/migrations/", "deploy/"]. Owner-grade surfaces.
-  "protected_paths": []
+  "protected_paths": [],
+
+  // When the configured sidekick's backend stops answering (the plugin
+  // probes /health and /v1/models only: they never name a model, so they
+  // cannot load or evict one), sidekick and critic work reroutes to this
+  // fallback until the backend is back. Any name from the sidekick list
+  // works. A gateway model means downtime costs pennies instead of free.
+  // null = no fallback: sidekick calls fail visibly instead.
+  "sidekick_fallback": "glm"
 }
