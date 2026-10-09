@@ -363,6 +363,27 @@ duplicating its flags, and adapts to it:
   template throws on an effort level it doesn't know, so adjust to your
   model.
 
+**Slot gate (llama.cpp and Strata).** A one-slot backend keeps the prompt
+cache of the last request only. Under opencode v2, a subagent runs in the
+background, so the lead can send requests while its child works. On
+2026-10-09, a lead with a 65k-token prompt and its grunt with a 14k-token
+prompt took turns on one-slot Strata for two hours. Each request removed the
+other's cache, so each request read its whole prompt from 0, and the
+requests reached the client timeout. The gate stops this:
+
+- One session owns the backend until its run ends.
+- A subagent of the owner takes the backend. Its parent waits.
+- Other sessions wait. When the owner ends, the deepest waiter goes first,
+  then the oldest.
+- An owner with no activity for 15 minutes, or a wait longer than
+  `slot_wait_minutes`, lets the waiter share the slot.
+
+The wait happens in the `model.request` hook, before opencode starts its
+request timer, so a wait never counts against the provider timeout. The
+slot count comes from `GET /slots` (Strata) or the unit's `--parallel`
+(llama.cpp). The gate works on v2 only. On v1 (the Mac host), the task
+tool blocks the parent, but parallel sibling tasks can still take turns.
+
 An example unit ships in `examples/llama-server.service`. Sidekick model
 requirements: tool calling, reasoning, and a chat template that accepts
 `reasoning_effort` through `chat_template_kwargs` under `--jinja`.

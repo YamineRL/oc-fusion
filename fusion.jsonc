@@ -72,6 +72,17 @@
   "local_parallel": null,
   "server_effort": null,
 
+  // Slot gate. A one-slot backend (Strata, llama-server --parallel 1) keeps
+  // the prompt cache of the last request only. Two sessions that take turns
+  // on it remove each other's cache, and every request then reads its whole
+  // prompt again. With the gate on, one session owns the backend until its
+  // run ends. A subagent goes before its parent. A backend with more than
+  // one slot is not gated.
+  //   slot_gate          false sends every request at once (old behavior)
+  //   slot_wait_minutes  the longest one request waits; then it shares the slot
+  "slot_gate": true,
+  "slot_wait_minutes": 60,
+
   // Opt-in remote Strata swap, off by default. When set to an ssh
   // destination, `oc-fusion sidekick strata|strata-coder` first runs
   // `strata-use iq3|coder` on that host so the remote Strata serves the

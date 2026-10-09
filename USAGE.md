@@ -104,8 +104,15 @@ climbing over sessions, it's under-delegating; say so to it.
 
 ## Things that bite
 
-- **Concurrent local calls queue.** One llama-server slot: a fan-out of six
-  scouts serializes. Two or three parallel tasks are fine.
+- **Concurrent local calls queue.** One llama-server or Strata slot: a
+  fan-out of six scouts serializes. Two or three parallel tasks are fine.
+- **The lead waits while its subagent uses a one-slot local model.** On a
+  one-slot backend, the slot gate gives the backend to one session until its
+  run ends. A subagent goes before its parent, and other sessions wait their
+  turn. A toast names the session that holds the slot. Without the gate, the
+  sessions take turns, each request removes the other's prompt cache, and
+  every request reads its whole prompt again from token 0. Turn the gate off
+  with `"slot_gate": false` in fusion.jsonc.
 - **15 idle minutes sleeps the model.** The next scout call pays a reload
   (seconds, from page cache). First call after a break feels slow; that's
   why.

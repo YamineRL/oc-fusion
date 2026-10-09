@@ -384,10 +384,10 @@ test("v2 setup: transform ordering, oracle hidden, tools, hooks", async () => {
   }
 
   // All the hooks the v1 plugin relied on have v2 homes. The eviction guard
-  // is llama.cpp only; the request stamp and sampler strip exist once per
-  // local provider (llamacpp, strata).
+  // is llama.cpp only; the slot gate, request stamp and sampler strip exist
+  // once per local provider (llamacpp, strata).
   const scopes = (name) => (h.hooks.get(name) ?? []).map((x) => x.opts?.providerID).sort();
-  assert.deepEqual(scopes("session:model.request"), ["llamacpp"]);
+  assert.deepEqual(scopes("session:model.request"), ["llamacpp", "llamacpp", "strata"]);
   assert.deepEqual(scopes("session:http.request"), ["llamacpp", "strata"]);
   for (const name of ["session:context", "session:generate", "session:title"]) {
     assert.deepEqual(scopes(name), ["llamacpp", "strata"], name);
@@ -494,7 +494,8 @@ test("strata requests: per-agent effort, body model kept, no residency probe or 
   const dir = makeDir({}, defaultOpencodeCfg);
   const h = fakeCtx(dir);
   await fusion.setup(h.ctx);
-  // Any fetch here would be a /v1/models probe or a guard read: Strata has neither.
+  // Any fetch here other than the slot gate's GET /slots would be a
+  // /v1/models probe or a guard read: Strata has neither.
   const calls = [];
   stubFetch(async (url) => { calls.push(String(url)); throw new Error("connection refused"); });
 
@@ -515,7 +516,7 @@ test("strata requests: per-agent effort, body model kept, no residency probe or 
   assert.equal(scout.model, "qwen3.8-flash-next-iq3_xxs");
   assert.deepEqual(scout.chat_template_kwargs, { enable_thinking: true, reasoning_effort: "low" });
   assert.equal((await send("critic")).chat_template_kwargs.reasoning_effort, "high");
-  assert.deepEqual(calls, []);
+  assert.deepEqual(calls.filter((u) => !u.endsWith("/slots")), []);
 });
 
 test("tool-output compression runs on Strata when the sidekick is Strata", async () => {
@@ -954,6 +955,87 @@ test("escalate advise mode writes brief and outbox envelope", async () => {
   assert.ok(fs.existsSync(res.metadata.file));
   const outbox = fs.readdirSync(path.join(dir, ".fusion", "outbox"));
   assert.ok(outbox.some((f) => f.startsWith("escalation-")));
+});
+
+// -------------------------------------------------------------- slot gate
+
+// One-slot Strata keeps the prompt cache of the last request only. On
+// 2026-10-09 a lead and its background grunt took turns on it, each request
+// removed the other's cache, and every prompt was read again from 0. The
+// gate holds the other session's request in model.request until the slot
+// owner's execution ends. /slots is unreachable here, so Strata counts as
+// one slot (the safe default).
+const strataReq = (sessionID, agent = "fusion") => ({
+  sessionID, agent, model: { providerID: "strata", id: "strata-iq3" }, baseURL: "http://127.0.0.1:8082/v1",
+});
+// Fire one request; report whether its model.request hook has resolved.
+const track = (h, sessionID, agent) => {
+  const t = { done: false };
+  t.promise = h.fireScoped("session:model.request", strataReq(sessionID, agent)).then(() => { t.done = true; });
+  return t;
+};
+const startSessions = async (h, list) => {
+  for (const [sid, parentID] of list) {
+    h.emit({ type: "session.created", sessionID: sid, ...(parentID ? { parentID } : {}) });
+    h.emit({ type: "session.execution.started", sessionID: sid });
+  }
+  await settle();
+};
+
+test("slot gate: a lead's request waits while its subagent holds one-slot Strata", async () => {
+  const h = fakeCtx(makeDir({}, defaultOpencodeCfg));
+  await fusion.setup(h.ctx);
+  await startSessions(h, [["L"], ["C", "L"]]);
+
+  await track(h, "L").promise; // free slot: the lead goes
+  await track(h, "C", "grunt").promise; // the child takes the slot from its parent
+  const lead = track(h, "L");
+  await settle();
+  assert.equal(lead.done, false, "the lead's request must wait while its child uses the slot");
+
+  h.emit({ type: "session.execution.succeeded", sessionID: "C" });
+  await lead.promise;
+});
+
+test("slot gate: sibling subagents take turns; a waiter that ends does not keep the slot", async () => {
+  const dir = makeDir({}, defaultOpencodeCfg);
+  const h = fakeCtx(dir);
+  await fusion.setup(h.ctx);
+  await startSessions(h, [["L"], ["A", "L"], ["B", "L"], ["X"], ["Y"]]);
+
+  await track(h, "A", "grunt").promise;
+  const b = track(h, "B", "grunt");
+  await settle();
+  assert.equal(b.done, false, "a sibling must wait for the other sibling");
+  h.emit({ type: "session.execution.succeeded", sessionID: "A" });
+  await b.promise;
+
+  // X waits for B, then the user interrupts X, and B ends at once (before
+  // X's next poll). The slot must be free, not handed to X, which sends
+  // nothing.
+  const x = track(h, "X");
+  await settle();
+  assert.equal(x.done, false, "an unrelated session must wait");
+  h.emit({ type: "session.execution.interrupted", sessionID: "X", reason: "user" });
+  h.emit({ type: "session.execution.succeeded", sessionID: "B" });
+  await settle();
+  const y = track(h, "Y");
+  await settle();
+  assert.equal(y.done, true, "the slot must be free after its owner ends");
+  await x.promise;
+
+  const waits = controlLines(dir).filter((l) => l.kind === "slot-wait").map((l) => l.session).sort();
+  assert.deepEqual(waits, ["B", "X"]);
+});
+
+test("slot gate: \"slot_gate\": false sends at once", async () => {
+  const h = fakeCtx(makeDir({ slot_gate: false }, defaultOpencodeCfg));
+  await fusion.setup(h.ctx);
+  await startSessions(h, [["L"], ["C", "L"]]);
+  await track(h, "C", "grunt").promise;
+  const lead = track(h, "L");
+  await settle();
+  assert.equal(lead.done, true);
 });
 
 // -------------------------------------------------------------- usage log

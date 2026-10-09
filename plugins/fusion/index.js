@@ -46,6 +46,7 @@ import {
   renderResultEnvelope,
   renderControllerState,
 } from "./controller-lib.mjs";
+import { makeSlotGate } from "./slot-gate.mjs";
 import {
   FUSION_RPC,
   KNOBS,
@@ -194,6 +195,14 @@ const DEFAULTS = {
   // the sidekick list works; a paid model means downtime costs money.
   // null = no fallback, sidekick calls fail visibly instead.
   sidekick_fallback: "glm",
+  // One session at a time on a one-slot local backend (Strata, llama-server
+  // with --parallel 1). Without it a lead and its background subagent take
+  // turns, each request removes the other's prompt cache, and long prompts
+  // never finish (2026-10-09). The owner keeps the backend until its run
+  // ends; a subagent goes before its parent. slot_wait_minutes caps one
+  // wait: after it the request goes anyway.
+  slot_gate: true,
+  slot_wait_minutes: 60,
 };
 
 // ------------------------------------------------------------------- helpers
@@ -2180,6 +2189,59 @@ const setupV2 = async (ctx) => {
     console.error(`${msg} Allowing because guard is "warn"; the wire rewrite sends the resident id instead.`);
   }, { providerID: "llamacpp" }));
 
+  // Slot gate (see slot-gate.mjs). The wait happens here, in model.request,
+  // because this hook runs before opencode builds the request and starts
+  // its timeout: a request that waits its turn cannot time out while it
+  // waits. A backend with more than one slot is not gated.
+  const slotCounts = { strata: null };
+  const slotsOf = async (providerID) => {
+    if (providerID === "llamacpp") return S().localRuntime?.parallel ?? S().unit.parallel ?? 1;
+    if (slotCounts.strata == null) {
+      try {
+        const res = await fetch(`${S().strataBase}/slots`, {
+          headers: { authorization: `Bearer ${readKeyFile(STRATA_KEY_FILE)}` },
+          signal: AbortSignal.timeout(2500),
+        });
+        const d = res.ok ? await res.json() : null;
+        const list = Array.isArray(d) ? d : d?.slots;
+        if (Array.isArray(list) && list.length) slotCounts.strata = list.length;
+      } catch { /* unknown: treat as one slot below, and probe again next time */ }
+    }
+    return slotCounts.strata ?? 1;
+  };
+  const backendName = (providerID) => (providerID === "strata" ? "Strata" : "llama-server");
+  const slotAgent = new Map(); // sessionID -> agent of its last step, for notices
+  const slotGate = makeSlotGate({
+    maxWaitMs: () => (Number(S().profile.slot_wait_minutes) || 60) * 60_000,
+    onWait: ({ backend, sid, owner }) => {
+      logControl({ kind: "slot-wait", backend, session: sid, owner });
+      emitNotice(
+        "slot-wait",
+        `${backendName(backend)} has one slot and the ${slotAgent.get(owner) ?? "other"} session ${owner.slice(-8)} is using it. This request waits its turn, so neither session loses its prompt cache.`,
+        "It starts when that session finishes its run. Set \"slot_gate\": false in fusion.jsonc to turn this off.",
+        { severity: "info", sessionID: sid },
+      );
+    },
+    onGrant: ({ backend, sid, reason, waitedMs }) => {
+      logControl({ kind: "slot-grant", backend, session: sid, reason, waited_s: Math.round(waitedMs / 1000) });
+      if (reason === "timeout" || reason === "stale") {
+        emitNotice(
+          "slot-timeout",
+          `${backendName(backend)}: session ${sid.slice(-8)} stopped waiting (${reason === "timeout" ? "slot_wait_minutes reached" : "the owner shows no activity"}) and now shares the slot.`,
+          "Both sessions now remove each other's prompt cache. Let one finish first if requests get slow.",
+          { sessionID: sid },
+        );
+      }
+    },
+  });
+  for (const providerID of LOCAL_PROVIDERS) {
+    registrations.push(await ctx.session.hook("model.request", async (event) => {
+      if (S().profile.slot_gate === false || !event.sessionID) return;
+      if ((await slotsOf(providerID)) > 1) return;
+      await slotGate.acquire(providerID, event.sessionID);
+    }, { providerID }));
+  }
+
   // The wire stamp. Aliases declare modelID "local" and plugin transforms
   // cannot beat the post-phase config builtin, so the resolved wire id is
   // rewritten at the last point of control: the serialized request body.
@@ -2808,6 +2870,14 @@ const setupV2 = async (ctx) => {
   const usageLoop = (async () => {
     try {
       for await (const event of ctx.event.subscribe({ signal: usageCtl.signal })) {
+        // Slot gate feed: the session tree and when each run starts and ends.
+        if (event.sessionID) {
+          if (event.type === "session.created") slotGate.created(event.sessionID, event.parentID);
+          else if (event.type === "session.execution.started") slotGate.started(event.sessionID);
+          else if (/^session\.execution\.(succeeded|failed|interrupted)$/.test(event.type)) slotGate.ended(event.sessionID);
+          else slotGate.activity(event.sessionID);
+          if (event.type === "session.step.started" && event.agent) slotAgent.set(event.sessionID, String(event.agent));
+        }
         if (event.type === "session.step.started") {
           stepMeta.set(event.assistantMessageID, {
             session: event.sessionID,
