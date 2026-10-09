@@ -143,8 +143,10 @@
       "models": {
         // `oc-fusion sidekick strata`: strata-iq3 is the general-model
         // alias. Run another quant (IQ3_S, IQ2_XS, ...)? Set "id" to the
-        // "model" /health reports and "limit.context" to its "max_context".
-        // The alias name stays the same.
+        // "model" /health reports. The alias name stays the same.
+        // limit.context is set BELOW Strata's max_context (98304) on purpose:
+        // opencode compacts at limit.context - compaction.reserved (~41k
+        // here). Past ~50k tokens a prompt re-read takes 20+ minutes.
         "strata-iq3": {
           "id": "qwen3.8-flash-next-iq3_xxs",
           "name": "Strata IQ3_XXS",
@@ -152,7 +154,7 @@
           "reasoning": true,
           "temperature": false,
           "options": { "reasoning_effort": "medium" },
-          "limit": { "context": 98304, "output": 16384 },
+          "limit": { "context": 49152, "output": 16384 },
           "cost": { "input": 0, "output": 0 }
         },
         // `oc-fusion sidekick strata-coder`: Coder IQ1_M. Strata serves one
