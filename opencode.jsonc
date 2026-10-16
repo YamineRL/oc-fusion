@@ -44,9 +44,9 @@
     // v1 keeps the last N turns verbatim; v2 counts TOKENS instead and reads
     // preserve_recent_tokens (mapped to keep.tokens). Both keys stay: turns
     // and tokens are not convertible, so this is an honest budget, not a
-    // translation. ~8 turns of chat ≈ 16000 tokens.
+    // translation. 8000 tokens: a smaller tail leaves more working room.
     "tail_turns": 8,
-    "preserve_recent_tokens": 16000,
+    "preserve_recent_tokens": 8000,
     "reserved": 8000
   },
 
@@ -83,8 +83,16 @@
       "npm": "@ai-sdk/openai-compatible",
       "name": "llama.cpp (local)",
       "options": {
-        "baseURL": "http://127.0.0.1:8080/v1",
-        "apiKey": "{file:~/.config/llama-server/api-key}"
+        // 2026-10-15: llama.cpp no longer owns a port of its own. llama-swap
+        // runs the process (stack/llama-swap) and strata-gate :8082 is the one
+        // queue in front of llama-swap :8091, so a client sends there and the
+        // wire id picks the engine. The old baseURL :8080 dialled the retired
+        // standalone llama-server, so this tier could not start.
+        "baseURL": "http://127.0.0.1:8082/v1",
+        // {file:} sends the whole file as one header. api-key has three lines
+        // (key, comment, key), which the gate answers with 400; line1 holds
+        // the key alone. The box config uses the same file.
+        "apiKey": "{file:~/.config/llama-server/api-key.line1}"
       },
       "models": {
         // "id" is a placeholder. The fusion plugin overwrites every local
@@ -102,7 +110,7 @@
           "reasoning": true,
           "temperature": false,
           "options": { "chat_template_kwargs": { "reasoning_effort": "medium" } },
-          "limit": { "context": 44000, "output": 16384 },
+          "limit": { "context": 45056, "input": 35000, "output": 16384 },
           "cost": { "input": 0, "output": 0 }
         },
         "fusion-sidekick-fast": {
@@ -112,7 +120,7 @@
           "reasoning": true,
           "temperature": false,
           "options": { "chat_template_kwargs": { "reasoning_effort": "low" } },
-          "limit": { "context": 44000, "output": 8192 },
+          "limit": { "context": 45056, "input": 35000, "output": 16384 },
           "cost": { "input": 0, "output": 0 }
         },
         "fusion-sidekick-deep": {
@@ -122,7 +130,7 @@
           "reasoning": true,
           "temperature": false,
           "options": { "chat_template_kwargs": { "reasoning_effort": "high" } },
-          "limit": { "context": 44000, "output": 32768 },
+          "limit": { "context": 45056, "input": 35000, "output": 32768 },
           "cost": { "input": 0, "output": 0 }
         }
       }
@@ -144,9 +152,15 @@
         // `oc-fusion sidekick strata`: strata-iq3 is the general-model
         // alias. Run another quant (IQ3_S, IQ2_XS, ...)? Set "id" to the
         // "model" /health reports. The alias name stays the same.
-        // limit.context is set BELOW Strata's max_context (98304) on purpose:
-        // opencode compacts at limit.context - compaction.reserved (~41k
-        // here). Past ~50k tokens a prompt re-read takes 20+ minutes.
+        // limit.input sets when opencode compacts: at limit.input -
+        // compaction.reserved (~72k here). A fresh 88k-token read takes 5 to
+        // 9 minutes (log, 2026-10-16); with the prompt cache a step reads only
+        // the new tokens. At ~41k a session compacted every 8 steps
+        // (2026-10-16), so the start moved up. limit.context stays at Strata's max_context
+        // (98304): opencode 2.0.29 lets the summary use at most
+        // limit.context - that start point. With context 49152 that was
+        // 8000 tokens, less than Strata's 12288-token think, and the summary
+        // failed with "reached the output token limit" (2026-10-16).
         "strata-iq3": {
           "id": "qwen3.8-flash-next-iq3_xxs",
           "name": "Strata IQ3_XXS",
@@ -154,7 +168,7 @@
           "reasoning": true,
           "temperature": false,
           "options": { "reasoning_effort": "medium" },
-          "limit": { "context": 49152, "output": 16384 },
+          "limit": { "context": 98304, "input": 80000, "output": 32768 },
           "cost": { "input": 0, "output": 0 }
         },
         // `oc-fusion sidekick strata-coder`: Coder IQ1_M. Strata serves one
@@ -191,7 +205,7 @@
       "permission": {
         "*": "allow",
         "doom_loop": "deny",
-        "external_directory": "ask",
+        "external_directory": "allow",
         "question": "allow"
       }
     },
@@ -241,7 +255,7 @@
       "permission": {
         "*": "allow",
         "doom_loop": "deny",
-        "external_directory": "ask",
+        "external_directory": "allow",
         "question": "allow",
         // Lead-only tools: no nested subagents, no escalation, no orders.
         "task": "deny",
