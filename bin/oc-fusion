@@ -63,12 +63,32 @@ first_key() {
   sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' "$1" | grep -v -e '^#' -e '^$' | head -n 1
 }
 
-# Passive residency read. With a systemd unit, the child server's cmdline
-# is the source; without one the server is remote and GET /v1/models on its
-# configured baseURL answers instead. Both only read; neither can trigger a
-# model load.
+# Is anything listening on a local TCP port? No tool is on every host: this
+# box has no lsof (found 2026-10-15) and macOS has no ss, so ask ss, then
+# lsof, then fuser. All checks are read-only and cannot start anything.
+port_listening() {
+  local p="${1-}"
+  [ -n "$p" ] || return 1
+  if command -v ss >/dev/null 2>&1; then
+    ss -H -tln 2>/dev/null | awk '{print $4}' | grep -qE "[:.]$p\$"
+    return
+  fi
+  if command -v lsof >/dev/null 2>&1; then
+    lsof -iTCP:"$p" -sTCP:LISTEN >/dev/null 2>&1
+    return
+  fi
+  command -v fuser >/dev/null 2>&1 && fuser -n tcp "$p" >/dev/null 2>&1
+}
+
+# Passive residency read. With a systemd unit the child server's cmdline is
+# the source, unless the caller names an endpoint: a live HTTP endpoint is
+# then the source, which is what the box needs now that llama-swap owns the
+# llama.cpp process. Without a unit the server is remote and GET /v1/models on
+# its configured baseURL answers instead. Both only read; neither can trigger
+# a model load.
 resident() {
-  if [ -f "$UNIT" ]; then
+  local want="${1-}"
+  if [ -f "$UNIT" ] && [ -z "$want" ]; then
     ps -eo args= 2>/dev/null | awk '/llama-server/ && /--alias/ {
       for (i=1;i<=NF;i++) if ($i=="--alias") { print $(i+1); exit }
     }'
@@ -76,7 +96,7 @@ resident() {
   fi
   local kf="${FUSION_API_KEY_FILE:-$HOME/.config/llama-server/api-key}"
   local base_url
-  base_url=$(provider_json llamacpp base)
+  base_url="${want:-$(provider_json llamacpp base)}"
   [ -n "$base_url" ] || return 0
   [ -f "$kf" ] || return 0
   curl -sS -m 4 -H "Authorization: Bearer $(first_key "$kf")" "${base_url%/}/models" 2>/dev/null \
@@ -450,13 +470,39 @@ EOF
         fi
       done
       base_url=$(provider_json llamacpp base)
+      # 2026-10-15: llama.cpp has no port of its own since llama-swap took the
+      # process over, so a disabled unit can sit next to a live endpoint.
+      # FUSION_BASE_URL and the config baseURL name where requests actually go;
+      # that endpoint is what must answer, and while it does its model list is
+      # the residency source.
+      endpoint="${FUSION_BASE_URL:-$base_url}"
       echo "baseURL   $base_url"
+      if [ -n "${FUSION_BASE_URL-}" ] && [ "$FUSION_BASE_URL" != "$base_url" ]; then
+        echo "plugin    FUSION_BASE_URL=$FUSION_BASE_URL (plugin probes there, opencode sends to baseURL)"
+      fi
+      ep_port=$(printf '%s' "$endpoint" | sed -n 's#.*:\([0-9][0-9]*\)/.*#\1#p')
+      ep_live=
+      unit_live=
+      port_listening "$ep_port" && ep_live=1
+      port_listening "$port" && unit_live=1
       case "$base_url" in
         *":$port/"*) echo "  ok: baseURL port matches the unit." ;;
-        *) echo "  WARN: baseURL does not use the unit's port ($port)." ;;
+        *)
+          if [ -n "$ep_live" ] && [ -n "$unit_live" ]; then
+            echo "  WARN: both $port (unit) and $ep_port (baseURL) answer; two local endpoints."
+          elif [ -n "$ep_live" ]; then
+            echo "  ok: baseURL answers on $ep_port; unit port $port is the retired standalone server."
+          else
+            echo "  WARN: nothing listens on the baseURL port ${ep_port:-?}; local agents will fail."
+          fi ;;
       esac
-      r=$(resident || true)
-      echo "resident  ${r:-<nothing loaded>}"
+      if [ -n "$ep_live" ]; then
+        r=$(resident "$endpoint" || true)
+        echo "resident  ${r:-<nothing loaded>}${r:+ (from the endpoint; llama-swap may swap)}"
+      else
+        r=$(resident || true)
+        echo "resident  ${r:-<nothing loaded>}"
+      fi
       if [ -n "$r" ]; then
         # The plugin stamps the resident wire id onto the local aliases at
         # load, so any pinned "id" here is a stale pin, not the source of truth.
@@ -487,7 +533,7 @@ EOF
         echo "endpoint  $base_url${llama_used:+ (remote llama-server)}${llama_used:- (not used by this panel)}"
         case "$base_url" in
           *://127.0.0.1:*|*://localhost:*|*://\[::1\]:*)
-            if [ -n "$port" ] && lsof -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then
+            if port_listening "$port"; then
               echo "  ok: something is listening on localhost:$port."
             else
               echo "  WARN: nothing listening on localhost:$port; the server or its tunnel is down."

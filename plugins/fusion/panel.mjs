@@ -310,13 +310,22 @@ export const AUDITED_DROPS = {
   "experimental.batch_tool": "v1-only: v2 batches through the codemode execute tool by default",
   "experimental.primary_tools": "v1-only: v2 scopes tools through per-agent permissions",
   "compaction.prune": "v1-only: the plugin prunes stale tool outputs on v2",
+  "compaction.tail_turns": "v1-only: v2 keeps recent tokens (preserve_recent_tokens -> keep.tokens), not turns",
 };
 
 const AUDITED_MODEL_FIELDS = new Set(["reasoning", "temperature", "tool_call", "options", "status", "interleaved", "release_date", "attachment", "experimental"]);
 
+// Providers whose models the plugin rewrites on the wire (the http.request
+// guard in index.js, which returns early for anything else). Only for these
+// is a model option key the plugin does not re-inject dead: see the
+// `options` branch below.
+export const LOCAL_PROVIDER_IDS = ["llamacpp", "strata"];
+
 // Scan one parsed config object and report every key v2 would drop, split
 // into audited (documented, intentional) and unaudited (silently dead).
-export function findDroppedKeys(cfg) {
+// opts.localProviders overrides which providers the plugin owns on the wire.
+export function findDroppedKeys(cfg, opts = {}) {
+  const localProviders = new Set(opts.localProviders ?? LOCAL_PROVIDER_IDS);
   const audited = [];
   const unaudited = [];
   if (!cfg || typeof cfg !== "object") return { audited, unaudited };
@@ -353,9 +362,17 @@ export function findDroppedKeys(cfg) {
         for (const k of Object.keys(model)) {
           if (!DROPPED_MODEL.includes(k) && !["tool_call", "options", "status", "interleaved"].includes(k)) continue;
           const path = `provider.${pname}.models.${mname}.${k}`;
-          // options is audited only for the key the plugin re-injects;
-          // anything else in it is silently dead on v2.
+          // A model's `options` migrate to `settings` on v2, and settings
+          // become the model's providerOptions on every request (config ->
+          // model defaults, `providerOptions: n.settings`). The provider
+          // adapter decides which of them it honors, so a key the plugin does
+          // not re-inject is NOT automatically dead: an Anthropic provider,
+          // for one, reads `thinking`. Only on the local providers does the
+          // plugin own the wire, and only there is everything else dropped
+          // (the adapter ignores unknown provider options, which is why the
+          // plugin injects chat_template_kwargs and reasoning_effort itself).
           if (k === "options") {
+            if (!localProviders.has(pname)) continue;
             const keys = Object.keys(model.options ?? {});
             const extras = keys.filter((x) => x !== "chat_template_kwargs" && x !== "reasoning_effort");
             if (extras.length) unaudited.push(`${path} (keys: ${extras.join(", ")})`);

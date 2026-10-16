@@ -9,7 +9,27 @@
 # control panel is the harness's own fusion.jsonc unless the project you are
 # in has one of its own, or FUSION_PROFILE names a third.
 set -euo pipefail
-HARNESS="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# Follow a link to the real script before locating the harness. `oc` is often
+# put on PATH as a symlink, and a link makes ${BASH_SOURCE[0]} name the link,
+# not the harness: the config path then points outside the harness and
+# opencode starts with no fusion at all. readlink -f is not on macOS, so walk
+# the links by hand.
+src="${BASH_SOURCE[0]}"
+while [ -L "$src" ]; do
+  dir="$(cd -P "$(dirname "$src")" && pwd)"
+  src="$(readlink "$src")"
+  case "$src" in
+    /*) ;;
+    *) src="$dir/$src" ;;
+  esac
+done
+HARNESS="$(cd -P "$(dirname "$src")/.." && pwd)"
+if [ ! -f "$HARNESS/opencode.jsonc" ]; then
+  echo "oc: loaded from $src, but no harness config at $HARNESS/opencode.jsonc" >&2
+  echo "oc: run the script in its own checkout, or link straight to that file." >&2
+  exit 1
+fi
 export OPENCODE_CONFIG="$HARNESS/opencode.jsonc"
 # Belt and braces: the harness bin on PATH, so the mcp.graft command
 # ["oc-fusion", "graft", "mcp"] resolves even if the plugin's rewrite to an

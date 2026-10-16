@@ -57,6 +57,7 @@ import {
   readPendingFile,
   clearPendingFile,
   findDroppedKeys,
+  LOCAL_PROVIDER_IDS,
   writePanelKey,
   writePanelEffort,
   usageTotals,
@@ -75,8 +76,10 @@ const STRATA_KEY_FILE = process.env.FUSION_STRATA_KEY_FILE ?? path.join(os.homed
 
 // Providers that run on your own hardware. Both get the per-agent
 // local_efforts and the sampler strip; only llamacpp gets the resident-id
-// rewrite, the eviction guard and the context clamp.
-const LOCAL_PROVIDERS = ["llamacpp", "strata"];
+// rewrite, the eviction guard and the context clamp. The id list lives in
+// panel.mjs because the dropped-key audit needs it too: a model option key
+// is only provably dead on the providers the plugin owns on the wire.
+const LOCAL_PROVIDERS = LOCAL_PROVIDER_IDS;
 
 // ---------------------------------------------------------------- base models
 

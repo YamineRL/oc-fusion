@@ -133,7 +133,7 @@ test("pending file bridge: jsonl in, list out, malformed lines skipped", () => {
 
 test("dropped-key audit splits audited v1-only keys from silently dead ones", () => {
   const { audited, unaudited } = findDroppedKeys({
-    experimental: { batch_tool: true, primary_tools: ["read"], unknowable_knob: 1 },
+    experimental: { batch_tool: true, primary_tools: ["read"], openTelemetry: true, unknowable_knob: 1 },
     compaction: { prune: true, tail_turns: 8 },
     subagent_depth: 3,
     provider: {
@@ -149,16 +149,36 @@ test("dropped-key audit splits audited v1-only keys from silently dead ones", ()
     },
   });
   // Audited: documented v1-only keys the plugin covers.
-  for (const k of ["experimental.batch_tool", "experimental.primary_tools", "compaction.prune"]) {
+  for (const k of ["experimental.batch_tool", "experimental.primary_tools", "compaction.prune", "compaction.tail_turns"]) {
     assert.ok(audited.includes(k), `expected ${k} audited`);
   }
   assert.ok(audited.includes("provider.llamacpp.models.fusion-sidekick.reasoning"));
   assert.ok(audited.includes("provider.llamacpp.models.fusion-sidekick.temperature"));
   // Unaudited: keys v2 drops with no documented reason.
   assert.ok(unaudited.includes("subagent_depth"));
-  assert.ok(unaudited.includes("compaction.tail_turns"));
+  assert.ok(unaudited.includes("experimental.openTelemetry"));
+  // Regression guard: every compaction key the harness config declares is
+  // v1-only on purpose, so none of them may nag on v2 again.
+  assert.ok(!unaudited.some((k) => k.startsWith("compaction.")), "compaction keys must all be audited");
   // options is audited only for the keys the plugin re-injects; top_k is dead.
   assert.ok(unaudited.some((k) => k.includes("options") && k.includes("top_k")));
+});
+
+test("a non-local provider's model options are not flagged dead", () => {
+  // v2 migrates model `options` to `settings` and settings become the
+  // model's providerOptions on every request, so the adapter decides.
+  // The plugin owns the wire only on the local providers.
+  const { audited, unaudited } = findDroppedKeys({
+    provider: {
+      "remote-provider": {
+        models: {
+          "qwen3.8-max": { options: { thinking: { type: "enabled", budgetTokens: 8192 } } },
+        },
+      },
+    },
+  });
+  assert.equal(unaudited.length, 0, `remote options must not nag: ${unaudited.join(", ")}`);
+  assert.equal(audited.length, 0, "and they are not an audited v1-only key either");
 });
 
 // --------------------------------------------------------------- prune ---
