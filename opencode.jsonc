@@ -87,7 +87,7 @@
           "reasoning": true,
           "temperature": false,
           "options": { "chat_template_kwargs": { "reasoning_effort": "medium" } },
-          "limit": { "context": 44000, "output": 16384 },
+          "limit": { "context": 45056, "input": 35000, "output": 16384 },
           "cost": { "input": 0, "output": 0 }
         },
         "fusion-sidekick-fast": {
@@ -97,7 +97,7 @@
           "reasoning": true,
           "temperature": false,
           "options": { "chat_template_kwargs": { "reasoning_effort": "low" } },
-          "limit": { "context": 44000, "output": 8192 },
+          "limit": { "context": 45056, "input": 35000, "output": 16384 },
           "cost": { "input": 0, "output": 0 }
         },
         "fusion-sidekick-deep": {
@@ -107,7 +107,7 @@
           "reasoning": true,
           "temperature": false,
           "options": { "chat_template_kwargs": { "reasoning_effort": "high" } },
-          "limit": { "context": 44000, "output": 32768 },
+          "limit": { "context": 45056, "input": 35000, "output": 32768 },
           "cost": { "input": 0, "output": 0 }
         }
       }
