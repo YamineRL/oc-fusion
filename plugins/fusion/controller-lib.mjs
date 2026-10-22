@@ -57,7 +57,45 @@ export function makeControllerState() {
     scope: { exceeded: false, impacted: 0, files: [] },
     filesTouched: new Set(),
     checks: [], // last N verification results: {cmd, exit, ts}
+    // Calls the gate refused: {tool, kind, reason}. Rendered after a
+    // compaction so the lead can check a refusal it remembers against fact.
+    blocked: [],
+    // callID -> {to, ts} for local-model subagents that are running now.
+    subagents: new Map(),
   };
+}
+
+// One GPU: a local-model subagent runs alone. The oracle is paid and remote.
+// Scout and grunt follow the sidekick, critic its own model. Any other agent
+// counts as local, because it may run on the lead's local model.
+export function isLocalSubagent(to, { sidekickIsLocal, criticModel, localProviders }) {
+  if (to === "oracle") return false;
+  if (to === "scout" || to === "grunt") return !!sidekickIsLocal;
+  if (to === "critic") return localProviders.includes(String(criticModel ?? "").split("/")[0]);
+  return true;
+}
+
+// Entries older than maxAgeMs are dropped first, so an after-hook that never
+// fired cannot hold the guard shut for ever.
+export function gateSubagent(state, to, local, now = Date.now(), maxAgeMs = 3 * 3600_000) {
+  for (const [id, r] of state.subagents) if (now - r.ts > maxAgeMs) state.subagents.delete(id);
+  if (!local || state.subagents.size === 0) return null;
+  const running = [...state.subagents.values()].map((r) => r.to).join(", ");
+  return `one GPU: the local subagent "${running}" is still running. ` +
+    `Wait for it to return, then dispatch "${to}". Never dispatch two local subagents in the same step.`;
+}
+
+export function startSubagent(state, id, to, now = Date.now()) {
+  state.subagents.set(id, { to: String(to ?? "?"), ts: now });
+}
+
+export function endSubagent(state, id) {
+  state.subagents.delete(id);
+}
+
+export function recordBlocked(state, tool, kind, reason) {
+  state.blocked.push({ tool: String(tool ?? "?"), kind, reason: String(reason ?? "") });
+  if (state.blocked.length > 20) state.blocked.shift();
 }
 
 export function recordEdit(state, rel, agent) {
@@ -250,6 +288,14 @@ export function renderControllerState(state, limits) {
     lines.push("- stalls/limits:", ...stalls.map((s) => `  - ${s}`));
   } else {
     lines.push("- no stalls or limits active");
+  }
+  // A lead that remembers a refusal no gate ever made stops delegating
+  // (2026-10-17), so "none" is stated, not left implicit.
+  if (state.blocked.length) {
+    lines.push(`- refused tool calls (${state.blocked.length}, last 5):`,
+      ...state.blocked.slice(-5).map((b) => `  - \`${b.tool}\` (${b.kind}): ${b.reason}`));
+  } else {
+    lines.push("- refused tool calls: none. No subagent dispatch, command or edit has been refused in this run.");
   }
   if (state.filesTouched.size) {
     lines.push(`- files touched this run: ${[...state.filesTouched].slice(0, 20).join(", ")}${state.filesTouched.size > 20 ? ` (+${state.filesTouched.size - 20} more)` : ""}`);

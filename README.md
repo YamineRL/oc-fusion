@@ -89,7 +89,7 @@ llama.cpp stays fully supported.
 | Agent    | Tier    | Does |
 |----------|---------|------|
 | `fusion` | lead    | plans, decides, makes the subtle edits, talks to you |
-| `scout`  | sidekick | finds things, traces call sites, reads long files, returns ~400 words |
+| `scout`  | sidekick | finds things, traces call sites, reads long files; read/glob/grep plus a narrow read-only shell; no edits |
 | `grunt`  | sidekick | executes decided changes, runs tests, iterates to green |
 | `critic` | sidekick* | reviews the diff before work is called done |
 | `oracle` | frontier| **off by default.** Only exists when `escalation` is `fable` |
@@ -99,6 +99,11 @@ a 3000-line file to find one function — and with a `graft/` index in the
 project, it often skips the file read entirely: the graph answers with exact
 file:line and the crux lines inline, so a find/trace becomes one tool call
 instead of a browse.
+
+In a note vault there is no graft graph, so scout uses read/glob/grep. Its
+shell is a narrow read-only allowlist: `ls`, `rg`, `fd`, `cat`, `sed -n`,
+`wc`, `head`, `tail`, `git log/diff/show`; `cd`, `find`, `awk`, `sort`,
+`uniq` and pipelines that start with a denied command are refused.
 
 The `critic` knob picks the reviewer (`local | strata | flash | lead`),
 independent of the sidekick. The default is `strata`: the Strata model on
@@ -381,8 +386,9 @@ requests reached the client timeout. The gate stops this:
 The wait happens in the `model.request` hook, before opencode starts its
 request timer, so a wait never counts against the provider timeout. The
 slot count comes from `GET /slots` (Strata) or the unit's `--parallel`
-(llama.cpp). The gate works on v2 only. On v1 (the Mac host), the task
-tool blocks the parent, but parallel sibling tasks can still take turns.
+(llama.cpp). The slot gate works on v2 only. On v1 (the Mac host), the
+task tool blocks the parent, and the one-GPU guard below refuses a second
+local subagent until the first returns.
 
 An example unit ships in `examples/llama-server.service`. Sidekick model
 requirements: tool calling, reasoning, and a chat template that accepts
@@ -406,9 +412,12 @@ harness is exactly the wrong shape for that, so there are two defenses:
    `"warn"` logs loudly and allows.
 
 `--parallel 1` also means concurrent local calls **queue** rather than
-overlap. Two parallel scouts are fine; eight are a stall. This is in the
-lead's prompt. Need real burst parallelism? Point `sidekick` at a cheap
-flash-class API model instead — that is exactly what that knob is for.
+overlap. The harness refuses a second local subagent while one is running,
+so dispatch one, wait for the return, then dispatch the next: a fan-out of
+six scouts is five refusals, not a queue. The paid oracle can run beside a
+local one. This is in the lead's prompt. Need real burst parallelism? Point
+`sidekick` at a cheap flash-class API model instead; that is exactly what
+that knob is for.
 
 ## Evidence routing
 

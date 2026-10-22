@@ -210,7 +210,7 @@
       }
     },
     "scout": {
-      "description": "Read-only explorer on the local model. Use for finding files, tracing call sites, summarizing how something works. Returns findings, never patches.",
+      "description": "Read-only explorer on the local model. Read/glob/grep plus a narrow read-only shell (ls, rg, fd, cat, sed -n, wc, head, tail, git log/diff/show); no cd/find/awk/sort/uniq. Graft only on code with a built graph. Returns findings, never patches.",
       "mode": "subagent",
       // No "model" here on purpose, also for grunt and critic: under v2 a
       // model in this table beats the plugin, and the fusion plugin sets
@@ -227,6 +227,10 @@
         "subagent": "deny",
         "escalate": "deny",
         "work_order": "deny",
+        // Read-only shell only. cd/find/awk/sort/uniq and pipelines that
+        // start with a denied command are not in this list. Scout's prompt
+        // says to use absolute paths and rg/glob for counts, so a brief that
+        // names a denied command does not become a retry loop.
         "bash": {
           "*": "deny",
           "git log*": "allow", "git diff*": "allow", "git show*": "allow",

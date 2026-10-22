@@ -36,6 +36,11 @@ import {
   extractFilePath,
   makeControllerState,
   recordEdit,
+  recordBlocked,
+  isLocalSubagent,
+  gateSubagent,
+  startSubagent,
+  endSubagent,
   recordCommandResult,
   recordVerification,
   failSignature,
@@ -1216,6 +1221,7 @@ export const server = async ({ directory }) => {
   function gate(callID, kind, reason, extra = {}) {
     logControl({ kind: profile.routing === "enforce" ? `${kind}-blocked` : `${kind}-observed`, ...extra, reason });
     if (profile.routing === "enforce") {
+      recordBlocked(ctrl, extra.tool ?? kind, kind, reason);
       throw new Error(`[fusion routing] ${reason}`);
     }
     if (ctrl.notices.size > 200) ctrl.notices.delete(ctrl.notices.keys().next().value);
@@ -1481,7 +1487,17 @@ export const server = async ({ directory }) => {
       const args = output?.args ?? {};
 
       if (input.tool === "task") {
-        logControl({ kind: "dispatch", session: input.sessionID, agent, to: args.subagent_type ?? args.agent ?? "?", desc: String(args.description ?? "").slice(0, 120) });
+        const to = args.subagent_type ?? args.agent ?? "?";
+        logControl({ kind: "dispatch", session: input.sessionID, agent, to, desc: String(args.description ?? "").slice(0, 120) });
+        // One GPU: blocks in every routing mode, not only enforce.
+        const local = isLocalSubagent(to, { sidekickIsLocal, criticModel: criticPatch.model, localProviders: LOCAL_PROVIDERS });
+        const busy = gateSubagent(ctrl, to, local);
+        if (busy) {
+          logControl({ kind: "one-gpu-blocked", to, reason: busy });
+          recordBlocked(ctrl, "task", "one-gpu", busy);
+          throw new Error(`[fusion] ${busy}`);
+        }
+        if (local) startSubagent(ctrl, input.callID, to);
         return;
       }
 
@@ -1530,6 +1546,7 @@ export const server = async ({ directory }) => {
     // in a paid context. Head and tail are kept verbatim so nothing the model
     // needs to quote exactly is silently lost.
     "tool.execute.after": async (input, output) => {
+      if (input.tool === "task") endSubagent(ctrl, input.callID);
       if (typeof output.output !== "string") return;
       let text = output.output;
 
@@ -2427,6 +2444,7 @@ const setupV2 = async (ctx) => {
     const { profile } = S();
     logControl({ kind: profile.routing === "enforce" ? `${kind}-blocked` : `${kind}-observed`, ...extra, reason });
     if (profile.routing === "enforce") {
+      recordBlocked(ctrl, event.tool, kind, reason);
       event.input = { reason, tool: event.tool, args: event.input };
       event.tool = "fusion_blocked";
       return;
@@ -2445,6 +2463,19 @@ const setupV2 = async (ctx) => {
     if (event.tool === "subagent" || event.tool === "task") {
       const to = args.agent ?? args.subagent_type ?? "?";
       logControl({ kind: "dispatch", session: event.sessionID, agent, to, desc: String(args.description ?? "").slice(0, 120) });
+      // One GPU: a second local subagent is refused in every routing mode,
+      // not only enforce. Two at once split the single slot and the GPU.
+      const { sidekickIsLocal, criticPatch } = S();
+      const local = isLocalSubagent(to, { sidekickIsLocal, criticModel: criticPatch.model, localProviders: LOCAL_PROVIDERS });
+      const busy = gateSubagent(ctrl, to, local);
+      if (busy) {
+        logControl({ kind: "one-gpu-blocked", to, reason: busy });
+        recordBlocked(ctrl, event.tool, "one-gpu", busy);
+        event.input = { reason: busy, tool: event.tool, args: event.input };
+        event.tool = "fusion_blocked";
+        return;
+      }
+      if (local) startSubagent(ctrl, event.id, to);
       // The oracle is parked unless escalation is explicitly "fable". The
       // registry cannot remove it (config re-adds it after this plugin's
       // transform), so the gate is what actually keeps paid calls opt-in.
@@ -2510,6 +2541,7 @@ const setupV2 = async (ctx) => {
   registrations.push(await ctx.tool.hook("execute.after", async (event) => {
     const { profile, localSummarize } = S();
     const toolName = event.tool;
+    if (toolName === "subagent" || toolName === "task") endSubagent(ctrl, event.id);
 
     // A gated call: drain its pending entry without counting (it never ran),
     // and never feed the refusal text into compression. The after event's

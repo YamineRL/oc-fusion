@@ -104,8 +104,11 @@ climbing over sessions, it's under-delegating; say so to it.
 
 ## Things that bite
 
-- **Concurrent local calls queue.** One llama-server or Strata slot: a
-  fan-out of six scouts serializes. Two or three parallel tasks are fine.
+- **Concurrent local calls do not overlap.** One llama-server or Strata
+  slot, and the harness refuses a second local subagent while one is
+  running. Dispatch one, wait for it to return, then dispatch the next: a
+  fan-out of six scouts is five refusals, not a queue. The paid oracle may
+  run beside a local one.
 - **The lead waits while its subagent uses a one-slot local model.** On a
   one-slot backend, the slot gate gives the backend to one session until its
   run ends. A subagent goes before its parent, and other sessions wait their
