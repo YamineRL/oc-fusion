@@ -88,11 +88,11 @@ llama.cpp stays fully supported.
 
 | Agent    | Tier    | Does |
 |----------|---------|------|
-| `fusion` | lead    | plans, decides, makes the subtle edits, talks to you |
+| `fusion` | lead    | plans, decides, makes the subtle edits, talks to you; only seat that spawns |
 | `scout`  | sidekick | finds things, traces call sites, reads long files; read/glob/grep plus a narrow read-only shell; no edits |
-| `grunt`  | sidekick | executes decided changes, runs tests, iterates to green |
-| `critic` | sidekick* | reviews the diff before work is called done |
-| `oracle` | frontier| **off by default.** Only exists when `escalation` is `fable` |
+| `grunt`  | sidekick | edits, runs shell and tests, iterates to green; cannot spawn |
+| `critic` | sidekick* | read-only diff review; no edits, writes, or unrestricted bash |
+| `oracle` | frontier| **off by default.** Paid, read-only; only when `escalation` is `fable` |
 
 `scout` is where the savings are. The lead never burns its own context reading
 a 3000-line file to find one function — and with a `graft/` index in the
@@ -104,6 +104,10 @@ In a note vault there is no graft graph, so scout uses read/glob/grep. Its
 shell is a narrow read-only allowlist: `ls`, `rg`, `fd`, `cat`, `sed -n`,
 `wc`, `head`, `tail`, `git log/diff/show`; `cd`, `find`, `awk`, `sort`,
 `uniq` and pipelines that start with a denied command are refused.
+
+`grunt` may edit and run shell, but cannot spawn, escalate, or file orders.
+`critic` and `oracle` are read-only and share scout's narrow shell allowlist,
+so a review cannot write through bash. Only the lead spawns subagents.
 
 The `critic` knob picks the reviewer (`local | strata | flash | lead`),
 independent of the sidekick. The default is `strata`: the Strata model on

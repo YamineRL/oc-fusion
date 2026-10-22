@@ -278,6 +278,21 @@
       "permission": {
         "edit": "deny",
         "write": "deny",
+        // Read-only reasoning: the same narrow shell as scout. No writes by
+        // proxy, and no cd/find/awk/sort/uniq.
+        "bash": {
+          "*": "deny",
+          "git log*": "allow", "git diff*": "allow", "git show*": "allow",
+          "rg *": "allow", "grep *": "allow", "fd *": "allow",
+          "ls *": "allow", "cat *": "allow", "sed -n *": "allow",
+          "wc *": "allow", "head *": "allow", "tail *": "allow",
+          "oc-fusion graft ask*": "allow",
+          "oc-fusion graft grep*": "allow",
+          "oc-fusion graft skeleton*": "allow",
+          "oc-fusion graft callers*": "allow",
+          "oc-fusion graft map*": "allow",
+          "oc-fusion graft check*": "allow"
+        },
         "task": "deny",
         "subagent": "deny",
         "escalate": "deny",
@@ -292,6 +307,21 @@
       "permission": {
         "edit": "deny",
         "write": "deny",
+        // Read-only review: the same narrow shell as scout. A review cannot
+        // write through bash, and no cd/find/awk/sort/uniq.
+        "bash": {
+          "*": "deny",
+          "git log*": "allow", "git diff*": "allow", "git show*": "allow",
+          "rg *": "allow", "grep *": "allow", "fd *": "allow",
+          "ls *": "allow", "cat *": "allow", "sed -n *": "allow",
+          "wc *": "allow", "head *": "allow", "tail *": "allow",
+          "oc-fusion graft ask*": "allow",
+          "oc-fusion graft grep*": "allow",
+          "oc-fusion graft skeleton*": "allow",
+          "oc-fusion graft callers*": "allow",
+          "oc-fusion graft map*": "allow",
+          "oc-fusion graft check*": "allow"
+        },
         "task": "deny",
         "subagent": "deny",
         "escalate": "deny",

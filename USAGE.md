@@ -21,6 +21,9 @@ local model. You get the best results by working *with* that split:
 - Give the task and its acceptance check, not a step-by-step procedure.
   The lead decides what to delegate; a procedure tempts it to do everything
   itself.
+- The lead is the only seat that spawns, escalates, or files work orders.
+  `scout`, `critic`, and `oracle` are read-only and share a narrow shell
+  allowlist; `grunt` edits and runs shell but cannot spawn.
 - Long output is handled for you: huge results go to a file and the lead
   sends scout at it; merely-large ones get summarized with head/tail intact.
 - Before you accept non-trivial work, ask for a critic pass. (`critic` is
