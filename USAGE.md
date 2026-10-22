@@ -38,7 +38,15 @@ oc-fusion critic local|flash|lead   # who reviews diffs — see README
 oc-fusion speed fast                # faster session: -1 reasoning notch on the lead
 oc-fusion escalation advise|run|fable
 oc-fusion routing observe|enforce   # measured stalls/scope: annotate vs block
+oc-fusion doctor                    # config vs the live server, incl. every model's ctx
 ```
+
+`oc-fusion doctor` is the one to run after any context change. It reads each
+llama-swap unit's `-c` and each model's `limit` in the global provider config,
+then flags a limit above the server's context (the server rejects the tail) or
+an `input` well under it (compaction throws away window). A model whose
+`limit.input` is stale compacts early even though the server has room: Sage Q5
+ran at 160K while its limit still said 64K, so sessions compacted near 40K.
 
 - **`base union-alpha`** runs the week's free lead: OpenCode Zen's stealth
   model for agentic coding, $0 in / $0 out. It advertises no reasoning

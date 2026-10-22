@@ -108,6 +108,120 @@ try:
 except Exception: pass' 2>/dev/null
 }
 
+# Per-model -c from the llama-swap config, both the key style
+# "Model-Id": { cmd: ... -c N } and the list style serve:
+# { models: [ { name: Model-Id, cmd: ... } ] }. Prints "id<TAB>ctx" lines.
+swap_config_ctx() {
+  local cfg="${LLAMA_SWAP_CONFIG:-$HOME/Documents/dev/active/stack/llama-swap/config.yaml}"
+  [ -f "$cfg" ] || return 0
+  python3 - "$cfg" <<'PY' 2>/dev/null
+import re, sys
+s = open(sys.argv[1], encoding="utf-8", errors="replace").read()
+# Each model entry starts at a key that holds a dict with either "cmd" or
+# "command", or a list item with name/cmd. Split on top-level model keys and
+# on "- name:" list items, then take the nearest preceding/next id.
+blocks = []
+for m in re.finditer(r'^  (?:"([^"]+)"|([\w.:/-]+))\s*:\s*$', s, re.M):
+    start = m.start()
+    nxt = re.search(r'^  (?:"[^"]+"|[\w.:/-]+)\s*:\s*$', s[m.end():], re.M)
+    end = m.end() + (nxt.start() if nxt else len(s) - m.end())
+    blocks.append((m.group(1) or m.group(2), s[start:end], start))
+for m in re.finditer(r'^\s*-\s+name:\s*"?([^"\n]+)"?\s*$', s, re.M):
+    start = m.start()
+    nxt = re.search(r'^\s*-\s+name:\s*"?[^"\n]+"?\s*$', s[m.end():], re.M)
+    end = m.end() + (nxt.start() if nxt else len(s) - m.end())
+    blocks.append((m.group(1).strip(), s[start:end], start))
+seen = set()
+for name, body, _ in sorted(blocks, key=lambda b: b[2]):
+    if name in seen:
+        continue
+    # -c lives inside the cmd block; --parallel in the same block.
+    cm = re.search(r'-c\s+(\d+)', body)
+    if not cm:
+        continue
+    seen.add(name)
+    print(f"{name}\t{cm.group(1)}")
+PY
+}
+
+# Compare every llama-swap unit's -c against the limit.context declared for it
+# in the GLOBAL provider config (opencode merges that with the harness config,
+# and it is where a non-fusion alias like sage-q5 lives). Two failure shapes:
+# context >= server ctx (server rejects a packed prompt) and limit.input far
+# under ctx (compaction throws away window: 65536 against 163840 compacted at
+# 40K on 2026-10-22). Prints its own report; empty when there is nothing to
+# compare (no swap config, or no global config).
+limits_check() {
+  local cfg="${LLAMA_SWAP_CONFIG:-$HOME/Documents/dev/active/stack/llama-swap/config.yaml}"
+  local global="${OPENCODE_GLOBAL_CONFIG:-$HOME/.config/opencode/opencode.json}"
+  [ -f "$cfg" ] || { echo "limits    skipped: no llama-swap config (set LLAMA_SWAP_CONFIG)"; return 0; }
+  local pairs
+  pairs=$(swap_config_ctx)
+  [ -n "$pairs" ] || return 0
+  # Pairs go in a temp file, not stdin: stdin is the python program.
+  tmp=$(mktemp "${TMPDIR:-/tmp}/oc-fusion-limits.XXXXXX")
+  printf '%s\n' "$pairs" >"$tmp"
+  python3 - "$global" "$cfg" "$tmp" <<'PY'
+import json, re, sys
+
+global_path, cfg_path, pairs_path = sys.argv[1:4]
+pairs = [line.split("\t") for line in open(pairs_path).read().splitlines() if "\t" in line]
+pairs = [[a, b, ""] for a, b in pairs]
+
+def load_lenient(path):
+    try:
+        return json.load(open(path, encoding="utf-8"))
+    except Exception:
+        s = open(path, encoding="utf-8").read()
+        s = re.sub(r'"(?:[^"\\]|\\.)*"|//[^\n]*',
+                   lambda m: m.group(0) if m.group(0).startswith('"') else "", s)
+        return json.loads(re.sub(r",(\s*[}\]])", r"\1", s))
+
+try:
+    g = load_lenient(global_path)
+except Exception:
+    print(f"limits    skipped: cannot read {global_path}")
+    raise SystemExit
+
+models = {}
+for prov in (g.get("provider") or {}).values():
+    for name, m in (prov.get("models") or {}).items():
+        if m.get("id"):
+            models[m["id"]] = (name, m.get("limit") or {})
+
+print(f"limits    per model (server {cfg_path}, limits {global_path})")
+bad = []
+for pair in pairs:
+    mid, ctx = pair[0], pair[1]
+    if not ctx.isdigit():
+        continue
+    ctx = int(ctx)
+    hit = models.get(mid)
+    if not hit:
+        continue              # alias not declared here; opencode never names it
+    name, lim = hit
+    d_ctx = lim.get("context")
+    d_in = lim.get("input")
+    d_out = lim.get("output")
+    flags = []
+    if isinstance(d_ctx, int) and d_ctx > ctx:
+        flags.append(f"context {d_ctx} > server {ctx}: server rejects the last tokens")
+    if isinstance(d_in, int) and isinstance(d_out, int) and d_in + d_out > ctx:
+        flags.append(f"input+output {d_in + d_out} > server {ctx}")
+    if isinstance(d_in, int) and d_in < ctx * 3 // 4:
+        flags.append(f"input {d_in} under 75% of {ctx}: compacts early")
+    state = "; ".join(flags) if flags else "ok"
+    if flags:
+        bad.append((mid, ctx, d_ctx, d_in, d_out))
+    print(f"  {mid:<32} ctx={ctx:<7} limit={d_ctx if d_ctx is not None else '?':<7} "
+          f"in={d_in if d_in is not None else '?':<7} out={d_out if d_out is not None else '?':<6} {state}")
+if bad:
+    print("  not-ok: set limit.context <= server ctx, then input <= context - output.")
+PY
+  rm -f "$tmp"
+}
+
+
 # The Strata model the panel uses ("" when sidekick and critic are not Strata):
 # a strata-* sidekick, else strata-iq3 for critic "strata".
 strata_alias() {
@@ -503,6 +617,13 @@ EOF
         r=$(resident || true)
         echo "resident  ${r:-<nothing loaded>}"
       fi
+      # $ROOT/opencode.jsonc declares at most THREE local aliases, all pointing
+      # at whatever is resident. The sizes of the other llama-swap units live
+      # in the server's config and in the GLOBAL provider config (which
+      # opencode merges with this one), so read those two and compare there.
+      # 2026-10-22: Sage Q5 ran -c 163840 while its limit still said 65536.
+      limits_out=$(limits_check)
+      [ -n "$limits_out" ] && printf '%s\n' "$limits_out"
       if [ -n "$r" ]; then
         # The plugin stamps the resident wire id onto the local aliases at
         # load, so any pinned "id" here is a stale pin, not the source of truth.
