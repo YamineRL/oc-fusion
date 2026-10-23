@@ -37,6 +37,8 @@ fs.writeFileSync(path.join(ROOT, "api-key"), "test-key\n");
 fs.writeFileSync(path.join(ROOT, "strata-key"), "strata-test-key\n");
 
 process.env.PATH = `${BIN}:${process.env.PATH}`;
+// A FUSION_BASE_URL from the developer shell would force remote mode.
+delete process.env.FUSION_BASE_URL;
 process.env.FUSION_UNIT = UNIT_PATH;
 process.env.FUSION_API_KEY_FILE = path.join(ROOT, "api-key");
 process.env.FUSION_STRATA_URL = "http://127.0.0.1:18082";
