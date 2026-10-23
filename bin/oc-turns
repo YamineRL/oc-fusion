@@ -1,0 +1,120 @@
+#!/usr/bin/env python3
+"""Where do agent turns go? A per-agent report of tool calls that failed.
+
+On a local model each step takes 30 to 90 s, so a denied, misnamed or
+truncated tool call is expensive. This report counts them per agent, by
+error type, from the opencode v2 server (read only: GET /api/session and
+GET /api/session/<id>/message). Use it to find the prompt or permission
+that wastes turns, and as the baseline before a tool change.
+
+  oc-turns [--hours N] [--dir PATH] [--url URL]
+
+--hours   only sessions updated in the last N hours (default 24)
+--dir     only sessions of this project directory (default: all)
+--url     server base URL (default: the background server in service.json)
+"""
+import argparse
+import importlib.machinery
+import importlib.util
+import json
+import statistics
+import sys
+import time
+from collections import Counter, defaultdict
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+_loader = importlib.machinery.SourceFileLoader("oc_server", str(HERE / "oc-server"))
+_spec = importlib.util.spec_from_loader("oc_server", _loader)
+ocs = importlib.util.module_from_spec(_spec)
+_loader.exec_module(ocs)
+
+# Error types that are the agent's own fault: a fixed prompt or permission
+# removes them. "aborted" (the user stopped it) and "unknown" (often a
+# remote 404) are shown but not counted as waste.
+WASTE = {"permission.rejected", "tool.execution", "tool.input-incomplete", "tool.input-invalid"}
+
+
+def pages(svc, path, params, stop):
+    """Yield items of a cursor-paged list, newest first, until stop(item)."""
+    cursor = None
+    while True:
+        q = dict(params, limit="200")
+        if cursor:
+            q["cursor"] = cursor
+        r = ocs.api(svc, path, q)
+        for item in r.get("data") or []:
+            if stop(item):
+                return
+            yield item
+        cursor = (r.get("cursor") or {}).get("next")
+        if not cursor or not r.get("data"):
+            return
+
+
+def main(argv):
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--hours", type=float, default=24)
+    ap.add_argument("--dir")
+    ap.add_argument("--url")
+    a = ap.parse_args(argv)
+    svc = {"url": a.url} if a.url else ocs.service()
+    if not svc:
+        print("oc-turns: no background server (service.json); pass --url", file=sys.stderr)
+        return 1
+    since = (time.time() - a.hours * 3600) * 1000
+    want_dir = str(Path(a.dir).resolve()) if a.dir else None
+
+    calls = Counter()
+    errors = defaultdict(Counter)
+    steps = defaultdict(list)   # agent -> step durations (s)
+    examples = {}
+    n_sessions = 0
+    for s in pages(svc, "/api/session", {}, lambda s: s["time"]["updated"] < since):
+        if want_dir and (s.get("location") or {}).get("directory") != want_dir:
+            continue
+        n_sessions += 1
+        prev = None  # messages come newest first
+        for m in pages(svc, f"/api/session/{s['id']}/message", {}, lambda m: m["time"]["created"] < since):
+            if m.get("type") != "assistant":
+                continue
+            agent = m.get("agent") or s.get("agent") or "?"
+            if prev is not None:
+                steps[agent].append((prev - m["time"]["created"]) / 1000)
+            prev = m["time"]["created"]
+            for p in m.get("content") or []:
+                if p.get("type") != "tool":
+                    continue
+                calls[agent] += 1
+                st = p.get("state") or {}
+                if st.get("status") == "error":
+                    kind = (st.get("error") or {}).get("type", "unknown")
+                    errors[agent][kind] += 1
+                    msg = (st.get("error") or {}).get("message", "")
+                    examples.setdefault((agent, kind), f"{p.get('name')}: {msg[:110]}")
+
+    print(f"sessions {n_sessions} in the last {a.hours:g} h"
+          + (f" for {want_dir}" if want_dir else ""))
+    if not calls:
+        print("no tool calls")
+        return 0
+    print(f"{'agent':<16} {'calls':>6} {'failed':>7} {'waste':>6} {'step s':>7} {'lost min':>9}  by type")
+    for agent in sorted(calls, key=lambda k: -sum(errors[k][t] for t in WASTE)):
+        e = errors[agent]
+        waste = sum(e[t] for t in WASTE)
+        med = statistics.median(steps[agent]) if steps[agent] else 0
+        # Keep the median sane: idle gaps between user prompts are not steps.
+        med = min(med, 600)
+        kinds = ", ".join(f"{k} {v}" for k, v in e.most_common())
+        print(f"{agent:<16} {calls[agent]:>6} {sum(e.values()):>7} {waste:>6} {med:>7.0f} "
+              f"{waste * med / 60:>9.1f}  {kinds}")
+    print("\nfirst example per agent and type:")
+    for (agent, kind), ex in sorted(examples.items()):
+        print(f"  {agent} / {kind}: {ex}")
+    print("\nwaste = permission.rejected, tool.execution (unknown tool, missing file, edit"
+          " miss), tool.input-incomplete, tool.input-invalid. lost min = waste x median step.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

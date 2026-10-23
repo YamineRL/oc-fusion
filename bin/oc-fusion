@@ -309,6 +309,7 @@ usage: oc-fusion <command>
   guard      <$(echo $GUARDS | tr ' ' '|')>
   compress   <on|off>
   usage                  aggregate .fusion/usage.jsonl (per-agent tokens + cost)
+  turns [--hours N]      failed tool calls per agent and the minutes they cost
   doctor                 check the config against Strata and the llama-server
                          unit (or its remote endpoint when no unit exists)
   graft      <build|check|map|ask|grep|skeleton|callers|blast|mcp> [args...]
@@ -793,6 +794,9 @@ else:
     print("(upper bound on what delegation saved; local agents actually cost $0)")
 PY
     ;;
+  turns)
+    # Failed tool calls per agent from the opencode server (read only).
+    shift; exec python3 "$ROOT/bin/oc-turns" "$@" ;;
   -h|--help|help) usage ;;
   *) usage; exit 1 ;;
 esac
