@@ -40,7 +40,7 @@ http.createServer((req, res) => {
 
 // A stub "background server": one sleep process (pid and start time are
 // real, environ controllable) plus a detached HTTP stub.
-async function makeServer(root, { sessions = {}, plugins = [], env = {} } = {}) {
+async function makeServer(root, { sessions = {}, plugins = [], env = {}, exe = "sleep" } = {}) {
   const stubJs = path.join(root, "stub-server.mjs");
   const portFile = path.join(root, "stub-port");
   fs.writeFileSync(stubJs, STUB_SERVER);
@@ -53,7 +53,7 @@ async function makeServer(root, { sessions = {}, plugins = [], env = {} } = {}) 
     },
     stdio: "ignore",
   });
-  const fakePid = spawn("sleep", ["300"], { env: { ...process.env, ...env } });
+  const fakePid = spawn(exe, ["300"], { env: { ...process.env, ...env } });
   for (let i = 0; i < 100 && !fs.existsSync(portFile); i++) {
     await new Promise((r) => setTimeout(r, 20));
   }
@@ -209,4 +209,31 @@ test("ensure: no service.json means opencode will start a fresh server; nothing 
   assert.equal(r.status, 0, r.stderr);
   assert.equal(r.stdout, "");
   assert.equal(pendingNotices(w.project).length, 0);
+});
+
+test("check: a server whose opencode binary was upgraded away is stale", async () => {
+  // brew upgrade swaps the binary and touches no config file, so only the
+  // executable shows it. The fake server is a copy of sleep named opencode,
+  // deleted after start (Linux shows "(deleted)"; macOS shows a path that is
+  // no longer the opencode on PATH).
+  const w = makeWorld();
+  const old = path.join(w.root, "old-cellar");
+  fs.mkdirSync(old);
+  const exe = path.join(old, "opencode");
+  fs.copyFileSync(spawnSync("sh", ["-c", "command -v sleep"], { encoding: "utf8" }).stdout.trim(), exe);
+  fs.chmodSync(exe, 0o755);
+  const srv = await makeServer(w.root, {
+    plugins: PLUGINS_OK,
+    env: { OPENCODE_CONFIG: w.env.OPENCODE_CONFIG },
+    exe,
+  });
+  fs.rmSync(exe);
+  w.writeService({ url: `http://127.0.0.1:${srv.port}`, pid: srv.pid });
+  try {
+    const r = w.run(["check"]);
+    assert.equal(r.status, 1, r.stdout + r.stderr);
+    assert.match(r.stdout, /stale: (its binary .*replaced|it runs .*opencode is now)/);
+  } finally {
+    srv.stop();
+  }
 });

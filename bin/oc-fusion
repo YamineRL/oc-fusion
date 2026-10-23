@@ -136,7 +136,10 @@ for name, body, _ in sorted(blocks, key=lambda b: b[2]):
     if name in seen:
         continue
     # -c lives inside the cmd block; --parallel in the same block.
-    cm = re.search(r'-c\s+(\d+)', body)
+    # Comments are not flags: a comment under one entry named another entry's
+    # "-c 45056" and Strata (no -c) inherited it (2026-10-23).
+    body = re.sub(r'(?m)^\s*#.*$', '', body)
+    cm = re.search(r'(?<![\w-])-c\s+(\d+)', body)
     if not cm:
         continue
     seen.add(name)
@@ -183,6 +186,7 @@ except Exception:
     print(f"limits    skipped: cannot read {global_path}")
     raise SystemExit
 
+reserved = (g.get("compaction") or {}).get("reserved") or 8000
 models = {}
 for prov in (g.get("provider") or {}).values():
     for name, m in (prov.get("models") or {}).items():
@@ -206,17 +210,25 @@ for pair in pairs:
     flags = []
     if isinstance(d_ctx, int) and d_ctx > ctx:
         flags.append(f"context {d_ctx} > server {ctx}: server rejects the last tokens")
-    if isinstance(d_in, int) and isinstance(d_out, int) and d_in + d_out > ctx:
-        flags.append(f"input+output {d_in + d_out} > server {ctx}")
+    # opencode v2 compacts at (input or context) - reserved, and the summary
+    # gets min(output, 32000, context - start) tokens. input + output > ctx is
+    # normal and fine; a summary budget too small to think and write is not
+    # (2026-10-16: 8000 tokens, every long compaction hit the output limit).
+    start = (d_in if isinstance(d_in, int) else (d_ctx or ctx)) - reserved
+    budget = min(d_out if isinstance(d_out, int) else 32000, 32000, (d_ctx or ctx) - start)
+    if budget < 16000:
+        flags.append(f"summary budget {budget} < 16000: long compactions can fail")
     if isinstance(d_in, int) and d_in < ctx * 3 // 4:
         flags.append(f"input {d_in} under 75% of {ctx}: compacts early")
     state = "; ".join(flags) if flags else "ok"
     if flags:
         bad.append((mid, ctx, d_ctx, d_in, d_out))
     print(f"  {mid:<32} ctx={ctx:<7} limit={d_ctx if d_ctx is not None else '?':<7} "
-          f"in={d_in if d_in is not None else '?':<7} out={d_out if d_out is not None else '?':<6} {state}")
+          f"in={d_in if d_in is not None else '?':<7} out={d_out if d_out is not None else '?':<6} "
+          f"compacts@{start} summary={budget} {state}")
 if bad:
-    print("  not-ok: set limit.context <= server ctx, then input <= context - output.")
+    print("  not-ok is advice, not truth: check the server ctx yourself before you edit.")
+    print("  Keep limit.context <= server ctx; keep context - (input - reserved) >= 16000.")
 PY
   rm -f "$tmp"
 }

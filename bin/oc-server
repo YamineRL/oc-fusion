@@ -23,6 +23,7 @@ error prints a warning and exits 0 in ensure mode.
 import base64
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -145,9 +146,42 @@ def watched_files(directory):
     return [f for f in files if f.is_file()]
 
 
+def server_exe(pid):
+    """Path of the server's executable, or None. Linux: /proc/<pid>/exe
+    (ends in " (deleted)" after a package upgrade). Else `ps -o comm=`,
+    which prints the full path on macOS."""
+    try:
+        return os.readlink(f"/proc/{pid}/exe")
+    except OSError:
+        pass
+    try:
+        out = subprocess.run(["ps", "-o", "comm=", "-p", str(pid)], capture_output=True,
+                             text=True, timeout=3).stdout.strip()
+        return out if out.startswith("/") else None
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def binary_reason(pid):
+    """A brew upgrade leaves the old server running on the old binary and
+    no config file changes, so the mtime check below cannot see it."""
+    exe = server_exe(pid)
+    if not exe or not os.path.basename(exe.removesuffix(" (deleted)")).startswith("opencode"):
+        return None
+    if exe.endswith(" (deleted)"):
+        return f"its binary {exe[:-10]} was replaced after it started"
+    cur = shutil.which("opencode")
+    if cur and os.path.realpath(cur) != os.path.realpath(exe):
+        return f"it runs {exe}, but opencode is now {os.path.realpath(cur)}"
+    return None
+
+
 def stale_reasons(svc, directory):
     pid = svc["pid"]
     reasons = []
+    br = binary_reason(pid)
+    if br:
+        reasons.append(br)
     cfg = server_env(pid, "OPENCODE_CONFIG")
     if cfg is not None and os.path.realpath(cfg or "/") != os.path.realpath(WANT_CONFIG):
         reasons.append(f"it uses OPENCODE_CONFIG={cfg or '(none)'}, not {WANT_CONFIG}")
