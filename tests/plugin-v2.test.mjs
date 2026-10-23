@@ -42,12 +42,14 @@ fs.writeFileSync(path.join(ROOT, "api-key"), "test-key\n");
 fs.writeFileSync(path.join(ROOT, "strata-key"), "# strata\n-strata-test-key\n");
 
 process.env.PATH = `${BIN}:${process.env.PATH}`;
+// A FUSION_BASE_URL from the developer shell would force remote mode.
+delete process.env.FUSION_BASE_URL;
 process.env.FUSION_UNIT = path.join(ROOT, "llama-server.service");
 process.env.FUSION_API_KEY_FILE = path.join(ROOT, "api-key");
 process.env.FUSION_STRATA_URL = "http://127.0.0.1:18082";
 process.env.FUSION_STRATA_KEY_FILE = path.join(ROOT, "strata-key");
 
-const fusion = (await import("../.opencode/plugin/fusion.js")).default;
+const fusion = (await import("../plugins/fusion/index.js")).default;
 
 function makeDir(profile = {}, opencodeCfg = null) {
   const dir = fs.mkdtempSync(path.join(ROOT, "proj-"));
@@ -209,12 +211,34 @@ function fakeCtx(dir, seed = {}) {
     return Promise.resolve({ dispose: () => {} });
   };
 
+  // Registered RPC services: definition -> handlers, plus emitted events.
+  // Mirrors ctx.rpc.register on the real host.
+  const rpcServices = new Map();
+  const rpcEmitted = [];
+
   const ctx = {
     location: { directory: dir },
     options: {},
-    agent: { transform: (cb) => { transforms.agent.push(cb); return Promise.resolve({ dispose: () => {} }); } },
-    model: { transform: (cb) => { transforms.model.push(cb); return Promise.resolve({ dispose: () => {} }); } },
+    agent: {
+      transform: (cb) => { transforms.agent.push(cb); return Promise.resolve({ dispose: () => {} }); },
+      // The real host replays registered transforms on rebuild; the fake
+      // does the same for every domain.
+      reload: () => { rebuild(); return Promise.resolve(); },
+    },
+    model: {
+      transform: (cb) => { transforms.model.push(cb); return Promise.resolve({ dispose: () => {} }); },
+      reload: () => { rebuild(); return Promise.resolve(); },
+    },
     mcp: { transform: (cb) => { transforms.mcp.push(cb); return Promise.resolve({ dispose: () => {} }); } },
+    rpc: {
+      register: (definition, handlers) => {
+        rpcServices.set(definition.id, { definition, handlers });
+        return Promise.resolve({
+          dispose: () => {},
+          events: { emit: (name, data) => { rpcEmitted.push({ rpc: definition.id, name, data }); return Promise.resolve(); } },
+        });
+      },
+    },
     tool: {
       transform: (cb) => {
         cb(toolEditor(tools));
@@ -245,6 +269,11 @@ function fakeCtx(dir, seed = {}) {
     mcps,
     tools,
     hooks,
+    rpcServices,
+    rpcEmitted,
+    // Call a registered RPC method as the TUI client would.
+    rpc: (method, input, callCtx = { error: (type, message, data) => ({ __rpcError: true, type, message, data }) }) =>
+      rpcServices.get("fusion")?.handlers?.[method]?.(input ?? {}, callCtx),
     rebuild,
     emit: (ev) => (eventWaiters.length ? eventWaiters.shift()(ev) : eventQueue.push(ev)),
     fire: async (name, event) => {
@@ -295,7 +324,21 @@ const fetchOk = (ids) => async (url) => {
   if (!String(url).endsWith("/v1/models")) throw new Error(`unexpected fetch ${url}`);
   return { ok: true, status: 200, json: async () => ({ data: ids.map((id) => ({ id, status: { value: "loaded" } })) }) };
 };
+// Setup now probes the configured local backends (passive: /health and
+// /v1/models only). The default answers "up" so existing behavior is
+// deterministic; tests that want a down backend install their own stub.
+const healthyBackend = async (url) => {
+  const u = String(url);
+  if (u.endsWith("/health")) {
+    return { ok: true, status: 200, json: async () => ({ model: "qwen3.8-flash-next-iq3_xxs", max_context: 98304, loaded: true }) };
+  }
+  if (u.endsWith("/v1/models")) {
+    return { ok: true, status: 200, json: async () => ({ data: [{ id: "resident-x", status: { value: "loaded" } }] }) };
+  }
+  throw new Error(`unexpected fetch ${u}`);
+};
 const stubFetch = (handler) => { globalThis.fetch = handler; };
+test.beforeEach(() => { globalThis.fetch = healthyBackend; });
 test.afterEach(() => { globalThis.fetch = realFetch; });
 
 // ----------------------------------------------------------- setup shape
@@ -343,10 +386,10 @@ test("v2 setup: transform ordering, oracle hidden, tools, hooks", async () => {
   }
 
   // All the hooks the v1 plugin relied on have v2 homes. The eviction guard
-  // is llama.cpp only; the request stamp and sampler strip exist once per
-  // local provider (llamacpp, strata).
+  // is llama.cpp only; the slot gate, request stamp and sampler strip exist
+  // once per local provider (llamacpp, strata).
   const scopes = (name) => (h.hooks.get(name) ?? []).map((x) => x.opts?.providerID).sort();
-  assert.deepEqual(scopes("session:model.request"), ["llamacpp"]);
+  assert.deepEqual(scopes("session:model.request"), ["llamacpp", "llamacpp", "strata"]);
   assert.deepEqual(scopes("session:http.request"), ["llamacpp", "strata"]);
   for (const name of ["session:context", "session:generate", "session:title"]) {
     assert.deepEqual(scopes(name), ["llamacpp", "strata"], name);
@@ -356,12 +399,9 @@ test("v2 setup: transform ordering, oracle hidden, tools, hooks", async () => {
   assert.ok(h.hooks.get("tool:execute.after")?.length === 1);
 });
 
-// ------------------------------------------------------ sidekick routing
+// ------------------------------------------------------ plugin list
 
-// The repo's own opencode.jsonc agent table, in the fake's config shape. Under
-// v2 a model declared there beats the plugin, so routing is only real if the
-// table leaves the sidekick seats alone; reading the file guards that.
-function repoAgentTable() {
+function repoConfig() {
   const text = fs.readFileSync(new URL("../opencode.jsonc", import.meta.url), "utf8");
   let out = "", inStr = false, esc = false;
   for (let i = 0; i < text.length; i++) {
@@ -371,7 +411,41 @@ function repoAgentTable() {
     if (c === "/" && text[i + 1] === "/") { while (i < text.length && text[i] !== "\n") i++; out += "\n"; continue; }
     out += c;
   }
-  const cfg = JSON.parse(out.replace(/,(\s*[}\]])/g, "$1"));
+  return JSON.parse(out.replace(/,(\s*[}\]])/g, "$1"));
+}
+
+// `oc` runs opencode in the user's project, not in the harness, so the
+// project-local auto-discovery never sees the harness plugins: only the
+// config's `plugin` list loads them. v2 drops a file entry ("configured
+// plugin path must be a directory") and v1 resolves a directory to its
+// index, so each entry must be a directory with an index file. A plugin file
+// left under .opencode/plugin(s)/ also auto-loads when opencode runs in the
+// harness itself and fails there as a duplicate plugin ID.
+test("plugin list: fusion then rtk load from directories, nothing auto-discovered beside them", async () => {
+  const root = new URL("../", import.meta.url).pathname;
+  const ids = [];
+  for (const entry of repoConfig().plugin ?? []) {
+    const dir = path.resolve(root, entry);
+    assert.ok(fs.statSync(dir).isDirectory(), `${entry} is not a directory`);
+    const index = ["index.js", "index.ts"].map((f) => path.join(dir, f)).find((f) => fs.existsSync(f));
+    assert.ok(index, `${entry} has no index.js or index.ts`);
+    ids.push((await import(index)).default.id);
+  }
+  assert.deepEqual(ids, ["fusion", "rtk"]);
+  for (const sub of ["plugin", "plugins"]) {
+    const dir = path.join(root, ".opencode", sub);
+    const files = fs.existsSync(dir) ? fs.readdirSync(dir).filter((f) => /\.(m?js|ts)$/.test(f)) : [];
+    assert.deepEqual(files, [], `.opencode/${sub}/ would auto-load a second copy`);
+  }
+});
+
+// ------------------------------------------------------ sidekick routing
+
+// The repo's own opencode.jsonc agent table, in the fake's config shape. Under
+// v2 a model declared there beats the plugin, so routing is only real if the
+// table leaves the sidekick seats alone; reading the file guards that.
+function repoAgentTable() {
+  const cfg = repoConfig();
   const agents = {};
   for (const [id, a] of Object.entries(cfg.agent)) {
     const i = a.model?.indexOf("/");
@@ -422,7 +496,8 @@ test("strata requests: per-agent effort, body model kept, no residency probe or 
   const dir = makeDir({}, defaultOpencodeCfg);
   const h = fakeCtx(dir);
   await fusion.setup(h.ctx);
-  // Any fetch here would be a /v1/models probe or a guard read: Strata has neither.
+  // Any fetch here other than the slot gate's GET /slots would be a
+  // /v1/models probe or a guard read: Strata has neither.
   const calls = [];
   stubFetch(async (url) => { calls.push(String(url)); throw new Error("connection refused"); });
 
@@ -443,7 +518,7 @@ test("strata requests: per-agent effort, body model kept, no residency probe or 
   assert.equal(scout.model, "qwen3.8-flash-next-iq3_xxs");
   assert.deepEqual(scout.chat_template_kwargs, { enable_thinking: true, reasoning_effort: "low" });
   assert.equal((await send("critic")).chat_template_kwargs.reasoning_effort, "high");
-  assert.deepEqual(calls, []);
+  assert.deepEqual(calls.filter((u) => !u.endsWith("/slots")), []);
 });
 
 test("tool-output compression runs on Strata when the sidekick is Strata", async () => {
@@ -884,6 +959,87 @@ test("escalate advise mode writes brief and outbox envelope", async () => {
   assert.ok(outbox.some((f) => f.startsWith("escalation-")));
 });
 
+// -------------------------------------------------------------- slot gate
+
+// One-slot Strata keeps the prompt cache of the last request only. On
+// 2026-10-09 a lead and its background grunt took turns on it, each request
+// removed the other's cache, and every prompt was read again from 0. The
+// gate holds the other session's request in model.request until the slot
+// owner's execution ends. /slots is unreachable here, so Strata counts as
+// one slot (the safe default).
+const strataReq = (sessionID, agent = "fusion") => ({
+  sessionID, agent, model: { providerID: "strata", id: "strata-iq3" }, baseURL: "http://127.0.0.1:8082/v1",
+});
+// Fire one request; report whether its model.request hook has resolved.
+const track = (h, sessionID, agent) => {
+  const t = { done: false };
+  t.promise = h.fireScoped("session:model.request", strataReq(sessionID, agent)).then(() => { t.done = true; });
+  return t;
+};
+const startSessions = async (h, list) => {
+  for (const [sid, parentID] of list) {
+    h.emit({ type: "session.created", sessionID: sid, ...(parentID ? { parentID } : {}) });
+    h.emit({ type: "session.execution.started", sessionID: sid });
+  }
+  await settle();
+};
+
+test("slot gate: a lead's request waits while its subagent holds one-slot Strata", async () => {
+  const h = fakeCtx(makeDir({}, defaultOpencodeCfg));
+  await fusion.setup(h.ctx);
+  await startSessions(h, [["L"], ["C", "L"]]);
+
+  await track(h, "L").promise; // free slot: the lead goes
+  await track(h, "C", "grunt").promise; // the child takes the slot from its parent
+  const lead = track(h, "L");
+  await settle();
+  assert.equal(lead.done, false, "the lead's request must wait while its child uses the slot");
+
+  h.emit({ type: "session.execution.succeeded", sessionID: "C" });
+  await lead.promise;
+});
+
+test("slot gate: sibling subagents take turns; a waiter that ends does not keep the slot", async () => {
+  const dir = makeDir({}, defaultOpencodeCfg);
+  const h = fakeCtx(dir);
+  await fusion.setup(h.ctx);
+  await startSessions(h, [["L"], ["A", "L"], ["B", "L"], ["X"], ["Y"]]);
+
+  await track(h, "A", "grunt").promise;
+  const b = track(h, "B", "grunt");
+  await settle();
+  assert.equal(b.done, false, "a sibling must wait for the other sibling");
+  h.emit({ type: "session.execution.succeeded", sessionID: "A" });
+  await b.promise;
+
+  // X waits for B, then the user interrupts X, and B ends at once (before
+  // X's next poll). The slot must be free, not handed to X, which sends
+  // nothing.
+  const x = track(h, "X");
+  await settle();
+  assert.equal(x.done, false, "an unrelated session must wait");
+  h.emit({ type: "session.execution.interrupted", sessionID: "X", reason: "user" });
+  h.emit({ type: "session.execution.succeeded", sessionID: "B" });
+  await settle();
+  const y = track(h, "Y");
+  await settle();
+  assert.equal(y.done, true, "the slot must be free after its owner ends");
+  await x.promise;
+
+  const waits = controlLines(dir).filter((l) => l.kind === "slot-wait").map((l) => l.session).sort();
+  assert.deepEqual(waits, ["B", "X"]);
+});
+
+test("slot gate: \"slot_gate\": false sends at once", async () => {
+  const h = fakeCtx(makeDir({ slot_gate: false }, defaultOpencodeCfg));
+  await fusion.setup(h.ctx);
+  await startSessions(h, [["L"], ["C", "L"]]);
+  await track(h, "C", "grunt").promise;
+  const lead = track(h, "L");
+  await settle();
+  assert.equal(lead.done, true);
+});
+
 // -------------------------------------------------------------- usage log
 
 test("step events write usage lines with agent+model attribution", async () => {
@@ -926,4 +1082,204 @@ test("codemode shared callID: queued pendings resolve by kind and value", async 
   const checks = controlLines(dir).filter((l) => l.kind === "check");
   assert.equal(checks.length, 1);
   assert.equal(checks[0].cmd, "make check");
+});
+
+// ------------------------------------------------ backend health + fallback
+//
+// The fallback contract: a local backend that does not answer its passive
+// probe reroutes sidekick seats to sidekick_fallback, emits one notice, and
+// refuses retries aimed at it. When the probe starts answering again the
+// seats flip back and one "back up" notice lands. The health timer is the
+// trigger for the flip-back, so the test captures the interval callback
+// and ticks it instead of waiting 30s.
+
+const captureInterval = () => {
+  const real = globalThis.setInterval;
+  let tick = null;
+  globalThis.setInterval = (cb) => {
+    tick = cb;
+    return { unref() {} };
+  };
+  return { tick: () => tick, restore: () => { globalThis.setInterval = real; } };
+};
+
+const strataDown = async (url) => {
+  const u = String(url);
+  if (u.includes("18082")) throw new Error("connection refused");
+  return healthyBackend(url);
+};
+
+const noticeKinds = (h) => h.rpcEmitted.filter((e) => e.name === "notice").map((e) => e.data.kind);
+
+test("backend down: strata seats reroute to sidekick_fallback, one notice, retries refused", async () => {
+  stubFetch(strataDown);
+  const iv = captureInterval();
+  const dir = makeDir({ sidekick_fallback: "glm" }, defaultOpencodeCfg);
+  const h = fakeCtx(dir, { cfgAgents: repoAgentTable() });
+  await fusion.setup(h.ctx);
+  h.rebuild();
+  try {
+    // scout/grunt/critic moved to the fallback ref.
+    const fb = { providerID: "merge-gateway", id: "zai/glm-5.3-flash" };
+    assert.deepEqual(h.agents.get("scout").model, fb);
+    assert.deepEqual(h.agents.get("grunt").model, fb);
+    assert.deepEqual(h.agents.get("critic").model, fb);
+
+    // The down state is visible as a notice (backlog; it fired before the
+    // fake RPC service existed), never silently.
+    const { items } = await h.rpc("notices", {});
+    const down = items.find((n) => n.kind === "backend-down");
+    assert.ok(down, "no backend-down notice");
+    assert.match(down.message, /Strata/);
+    assert.match(down.action, /fallback/i);
+
+    // A retry aimed at the down backend is refused.
+    const retry = { model: { providerID: "strata", id: "strata-iq3" } };
+    await h.fireScoped("session:retry", retry);
+    assert.deepEqual(retry.decision, { retry: false });
+
+    // Recovery: the health tick re-probes, the seats flip back, one notice.
+    stubFetch(healthyBackend);
+    await iv.tick()();
+    await settle();
+    h.rebuild();
+    const ref = { providerID: "strata", id: "strata-iq3" };
+    assert.deepEqual(h.agents.get("scout").model, ref);
+    assert.ok(noticeKinds(h).includes("backend-up"), "no backend-up notice");
+    assert.equal(noticeKinds(h).filter((k) => k === "backend-up").length, 1);
+  } finally {
+    iv.restore();
+  }
+});
+
+test("backend down with no fallback: seats stay put and the notice says so", async () => {
+  stubFetch(strataDown);
+  const dir = makeDir({ sidekick_fallback: null }, defaultOpencodeCfg);
+  const h = fakeCtx(dir, { cfgAgents: repoAgentTable() });
+  await fusion.setup(h.ctx);
+  h.rebuild();
+
+  const ref = { providerID: "strata", id: "strata-iq3" };
+  assert.deepEqual(h.agents.get("scout").model, ref);
+  const { items } = await h.rpc("notices", {});
+  const down = items.find((n) => n.kind === "backend-down");
+  assert.ok(down);
+  assert.match(down.action, /sidekick_fallback/);
+});
+
+// ------------------------------------------------------------------- RPC
+
+test("fusion RPC: status, choices, set writes fusion.jsonc, notices drains the pending file", async () => {
+  // speed and local_efforts must exist in fusion.jsonc for `set` to write
+  // them: a missing key is a deliberate write-failed, not a silent add.
+  const dir = makeDir(
+    { sidekick: "strata", speed: "normal", local_efforts: { scout: "low" } },
+    defaultOpencodeCfg,
+  );
+  const h = fakeCtx(dir, { cfgAgents: repoAgentTable() });
+  await fusion.setup(h.ctx);
+
+  const st = await h.rpc("status", { sessionID: "s-rpc" });
+  assert.ok(st.banner);
+  assert.equal(st.profile.sidekick, "strata");
+  assert.equal(st.backend.strata.up, true);
+  assert.equal(st.backend.llamacpp.used, false);
+  assert.equal(st.session.id, "s-rpc");
+  assert.ok(Array.isArray(st.dropped.audited) && Array.isArray(st.dropped.unaudited));
+
+  const choices = await h.rpc("choices", { key: "sidekick" });
+  assert.ok(choices.options.length > 0);
+  assert.equal(choices.current, "strata");
+  const bad = await h.rpc("choices", { key: "nonsense" });
+  assert.ok(bad.error);
+
+  // set writes the profile key and live-reloads: speed fast drops the lead
+  // step budget on the next rebuild.
+  const set = await h.rpc("set", { key: "speed", value: "fast" });
+  assert.equal(set.applied, true);
+  const profile = JSON.parse(fs.readFileSync(path.join(dir, "fusion.jsonc"), "utf8"));
+  assert.equal(profile.speed, "fast");
+  h.rebuild();
+  assert.equal(h.agents.get("fusion").steps, 200);
+
+  const badSet = await h.rpc("set", { key: "speed", value: "ludicrous" });
+  assert.equal(badSet.__rpcError, true);
+  assert.equal(badSet.type, "bad-value");
+
+  const effortSet = await h.rpc("set", { key: "local_efforts.grunt", value: "xhigh" });
+  assert.equal(effortSet.applied, true);
+  const p2 = JSON.parse(fs.readFileSync(path.join(dir, "fusion.jsonc"), "utf8"));
+  assert.equal(p2.local_efforts.grunt, "xhigh");
+
+  // A notice bin/oc-server dropped on disk shows up in the backlog and the
+  // file is consumed.
+  fs.mkdirSync(path.join(dir, ".fusion"), { recursive: true });
+  const pending = path.join(dir, ".fusion", "pending-notices.jsonl");
+  fs.writeFileSync(pending, JSON.stringify({ kind: "stale-server", message: "the running server predates this checkout" }) + "\n");
+  const { items } = await h.rpc("notices", {});
+  assert.ok(items.some((n) => n.kind === "stale-server"));
+  assert.equal(fs.readFileSync(pending, "utf8"), "");
+});
+
+// ----------------------------------------------------------------- prune
+
+test("compaction.prune parity: the context hook shrinks stale tool outputs", async () => {
+  const dir = makeDir({}, {
+    ...defaultOpencodeCfg,
+    compaction: { prune: true },
+  });
+  const h = fakeCtx(dir);
+  await fusion.setup(h.ctx);
+
+  const messages = [
+    { role: "tool", content: [{ type: "tool-result", toolCallId: "a", result: { type: "text", value: "x".repeat(60000) } }] },
+    { role: "tool", content: [{ type: "tool-result", toolCallId: "b", result: { type: "error", value: "boom" } }] },
+    { role: "tool", content: [{ type: "tool-result", toolCallId: "c", result: { type: "text", value: "y".repeat(500) } }] },
+  ];
+  await h.fire("session:context", { sessionID: "s1", messages, options: {} });
+
+  assert.match(messages[0].content[0].result.value, /\[pruned \d+ characters\]$/);
+  assert.equal(messages[1].content[0].result.value, "boom");
+  assert.equal(messages[2].content[0].result.value.length, 500);
+});
+
+// --------------------------------------------------------- failure notices
+
+test("http.response notices: context 400 decoded once, other errors once each", async () => {
+  const dir = makeDir({ sidekick: "local" }, defaultOpencodeCfg);
+  const h = fakeCtx(dir);
+  await fusion.setup(h.ctx);
+
+  const respond = async (status, body) => {
+    const res = new Response(body, { status });
+    await h.fireScoped("session:http.response", {
+      sessionID: "s1",
+      agent: "grunt",
+      model: { providerID: "llamacpp", id: "resident-x" },
+      response: res,
+    });
+  };
+  await respond(400, "request exceeds the available context size");
+  await respond(400, "request exceeds the available context size");
+  await respond(500, "internal error");
+
+  const notices = h.rpcEmitted.filter((e) => e.name === "notice").map((e) => e.data);
+  assert.equal(notices.filter((n) => n.kind === "context-400").length, 1, "same 400 dedupes to one notice");
+  const err = notices.find((n) => n.kind === "backend-error");
+  assert.ok(err);
+  assert.match(err.message, /HTTP 500/);
+});
+
+test("a reply that ends on length with reasoning tokens gets a thinking-truncated notice", async () => {
+  const dir = makeDir({ sidekick: "local" }, defaultOpencodeCfg);
+  const h = fakeCtx(dir);
+  await fusion.setup(h.ctx);
+
+  h.emit({ type: "session.step.started", sessionID: "s7", assistantMessageID: "am9", agent: "grunt", model: { providerID: "llamacpp", id: "resident-x" } });
+  h.emit({ type: "session.step.ended", sessionID: "s7", assistantMessageID: "am9", finish: "length", cost: 0, tokens: { input: 10, output: 5, reasoning: 900 } });
+  for (let i = 0; i < 50 && !noticeKinds(h).length; i++) await settle();
+
+  const n = h.rpcEmitted.find((e) => e.data?.kind === "thinking-truncated");
+  assert.ok(n, "no thinking-truncated notice");
+  assert.match(n.data.action, /effort/i);
 });

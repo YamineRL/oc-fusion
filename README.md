@@ -3,13 +3,13 @@
 A two-tier coding harness for [opencode](https://opencode.ai), built around
 local inference you already own.
 
-A strong lead model does the thinking — frontier-class in the on-par
-configuration, GLM-5.3-class as the sensible floor. A model on your own GPU —
-or a cheap flash-class API model — does the reading, searching, mechanical
+A strong lead model does the thinking (frontier-class in the on-par
+configuration, GLM-5.3-class as the sensible floor). A model on your own GPU
+(or a cheap flash-class API model) does the reading, searching, mechanical
 editing, and test-running. What the lead cannot crack goes to a Claude Code
 subscription you already pay for, instead of a per-token frontier fallback.
 And under both tiers, a local [Graft](https://github.com/trailhq/Graft) graph
-maps every project — symbols, call edges, exact file:line — while
+maps every project (symbols, call edges, exact file:line) while
 [rtk](https://github.com/rtk-ai/rtk) compresses command output before any
 agent reads it. No agent re-explores the repo from zero, and no agent reads
 two hundred lines to learn a test failed.
@@ -26,7 +26,7 @@ measurements and are marked as such.
 
 Most tokens in a coding session are spent *reading* things, not reasoning
 about them. This is the pattern commercial agent products converged on in
-2026 — notably Devin's Fusion, which pairs a frontier lead with a cheap
+2026, notably Devin's Fusion, which pairs a frontier lead with a cheap
 sidekick and bills per token for both. Artificial Analysis measured the
 effect there: Fable 5.1 alone cost $12.40/task, while Fable 5.1 + SWE-2 hit
 the same index score at $7.90.
@@ -48,13 +48,13 @@ Two configurations, one harness:
   sidekick that bills $0 because it is your own hardware. This is the config
   to reach for when the task is hard and you want Fusion's shape at a
   fraction of Fusion's bill.
-- **Frugal** (default): `oc-fusion base glm`. GLM-5.3 is the floor — below
+- **Frugal** (default): `oc-fusion base glm`. GLM-5.3 is the floor: below
   it you lose the "strong lead" property the architecture depends on, and
   the savings should come from the sidekick instead. Cheap flash-class
   models are for the sidekick tier, not the lead.
 - **Free lead**: `oc-fusion base union-alpha`. OpenCode Zen's stealth model
   built for agentic coding, released 2026-09-16, $0 in / $0 out. It
-  advertises no reasoning levels — the model manages its own effort, so the
+  advertises no reasoning levels: the model manages its own effort, so the
   `reasoning` knob is ignored for it (the harness sends no variant). A
   stealth model has no public benchmarks: treat it as an experiment while
   Zen keeps it free, not as a floor replacement. Use it when the lead
@@ -62,7 +62,7 @@ Two configurations, one harness:
   cutting it.
 
 The sidekick is where the money is. If you run a local inference server at
-all, the marginal cost of a sidekick token is zero — and the harness
+all, the marginal cost of a sidekick token is zero, and the harness
 discovers whatever model your server has resident, so it never asks for a
 model that isn't loaded.
 
@@ -88,17 +88,26 @@ llama.cpp stays fully supported.
 
 | Agent    | Tier    | Does |
 |----------|---------|------|
-| `fusion` | lead    | plans, decides, makes the subtle edits, talks to you |
-| `scout`  | sidekick | finds things, traces call sites, reads long files, returns ~400 words |
-| `grunt`  | sidekick | executes decided changes, runs tests, iterates to green |
-| `critic` | sidekick* | reviews the diff before work is called done |
-| `oracle` | frontier| **off by default.** Only exists when `escalation` is `fable` |
+| `fusion` | lead    | plans, decides, makes the subtle edits, talks to you; only seat that spawns |
+| `scout`  | sidekick | finds things, traces call sites, reads long files; read/glob/grep plus a narrow read-only shell; no edits |
+| `grunt`  | sidekick | edits, runs shell and tests, iterates to green; cannot spawn |
+| `critic` | sidekick* | read-only diff review; no edits, writes, or unrestricted bash |
+| `oracle` | frontier| **off by default.** Paid, read-only; only when `escalation` is `fable` |
 
 `scout` is where the savings are. The lead never burns its own context reading
-a 3000-line file to find one function — and with a `graft/` index in the
+a 3000-line file to find one function. And with a `graft/` index in the
 project, it often skips the file read entirely: the graph answers with exact
 file:line and the crux lines inline, so a find/trace becomes one tool call
 instead of a browse.
+
+In a note vault there is no graft graph, so scout uses read/glob/grep. Its
+shell is a narrow read-only allowlist: `ls`, `rg`, `fd`, `cat`, `sed -n`,
+`wc`, `head`, `tail`, `git log/diff/show`; `cd`, `find`, `awk`, `sort`,
+`uniq` and pipelines that start with a denied command are refused.
+
+`grunt` may edit and run shell, but cannot spawn, escalate, or file orders.
+`critic` and `oracle` are read-only and share scout's narrow shell allowlist,
+so a review cannot write through bash. Only the lead spawns subagents.
 
 The `critic` knob picks the reviewer (`local | strata | flash | lead`),
 independent of the sidekick. The default is `strata`: the Strata model on
@@ -227,10 +236,35 @@ fish_add_path /path/to/oc-fusion/bin   # fish, once; then `oc` and `oc-fusion` w
 echo 'export PATH="/path/to/oc-fusion/bin:$PATH"' >> ~/.bashrc   # bash, once; then restart your shell
 ```
 
+fish 4.x ships a built-in `oc.fish` for OpenShift's `oc` that runs
+`oc completion fish | source`, which prints opencode's help and floods
+errors. `examples/oc.fish` overrides it so `oc` completes like `opencode`:
+
+```fish
+cp /path/to/oc-fusion/examples/oc.fish ~/.config/fish/completions/oc.fish
+```
+
 The control panel is resolved in this order: `$FUSION_PROFILE`, then a
 `fusion.jsonc` in the project you are working in (so a repo can pin its own
 lead and sidekick), then the harness's own. Running plain `opencode` inside
 the harness directory also works, because opencode reads `./opencode.jsonc`.
+
+### The background server
+
+opencode v2 attaches every window to one background server
+(`opencode serve --service`). That server keeps the config and plugins it
+started with. A server started from another checkout, or before a config
+or plugin edit, keeps the old harness, and opencode only logs a warning.
+
+Before the TUI and `oc run`, `oc` runs `bin/oc-server ensure`:
+
+- stale server, no session running: restart it with this harness.
+- stale server, a session running: keep it, and start this window on a
+  private server (`--standalone`) with this harness.
+- then warn if the fusion or rtk plugin is not active in this project.
+
+`oc-fusion doctor` shows the same report (`bin/oc-server check`).
+`OC_NO_SERVER_CHECK=1 oc` skips the check.
 
 ## The control panel
 
@@ -281,6 +315,40 @@ fit, VRAM decides the speed, the default context, and what runs in Strata's
 low-RAM mode on a 32 GB PC. Option B above applies the rules from Strata's
 README and [docs/MODELS.md](https://github.com/Niko1221/Strata/blob/main/docs/MODELS.md).
 
+One Strata server flag matters here: set `"fit_max_tokens": true` in the
+model's `strata-<model>.json` (or pass `--fit-max-tokens`). Without it,
+opencode can ask for more output tokens than the context has left and
+Strata answers 400 ("requests are never truncated"); with it, Strata
+shortens `max_tokens` to the room left. Strata reads it only at start, so
+restart the server after changing it.
+
+## Running from another machine
+
+The harness works on a client machine with no local GPU, for example a
+laptop whose llama-server and Strata both run on a remote host, reached
+over an SSH tunnel that forwards the ports to localhost. Nothing to install
+beyond the tunnel: set the two `baseURL` values in `opencode.jsonc` to the
+forwarded endpoints (`provider.llamacpp.options.baseURL` and
+`provider.strata.options.baseURL`), and put the two key files in their
+usual places
+(`~/.config/llama-server/api-key`, `~/.config/strata/api-key`).
+
+- **No systemd unit needed.** When the unit file is absent, or
+  `FUSION_BASE_URL` is set, the plugin discovers the llama.cpp server over
+  HTTP instead: `/v1/models` for the resident model, `/props` for the
+  context, passively, so discovery can never trigger a load. The panel keys
+  `local_ctx`, `local_parallel` and `server_effort` in `fusion.jsonc` fill
+  what HTTP cannot report; `oc-fusion doctor` checks the endpoint the same
+  way. `FUSION_BASE_URL` overrides the llamacpp `baseURL` when your tunnel
+  lands on a different port.
+- **Remote Strata swap is opt-in.** `oc-fusion sidekick strata` /
+  `strata-coder` can ask the remote host to serve the matching model first:
+  set `"strata_remote_swap"` in `fusion.jsonc` to an ssh destination and
+  the switch runs `strata-use iq3|coder` there before changing the panel.
+  Leave it `null` (the default) to swap Strata by hand.
+- **graft** stays offline-wrapped: `sandbox-exec` on macOS, `unshare` on
+  Linux. `oc-fusion doctor` reports which isolation it found.
+
 ## Your local server is the source of truth
 
 This section applies to llama.cpp. For Strata, the plugin sends the
@@ -304,6 +372,28 @@ duplicating its flags, and adapts to it:
   template throws on an effort level it doesn't know, so adjust to your
   model.
 
+**Slot gate (llama.cpp and Strata).** A one-slot backend keeps the prompt
+cache of the last request only. Under opencode v2, a subagent runs in the
+background, so the lead can send requests while its child works. On
+2026-10-09, a lead with a 65k-token prompt and its grunt with a 14k-token
+prompt took turns on one-slot Strata for two hours. Each request removed the
+other's cache, so each request read its whole prompt from 0, and the
+requests reached the client timeout. The gate stops this:
+
+- One session owns the backend until its run ends.
+- A subagent of the owner takes the backend. Its parent waits.
+- Other sessions wait. When the owner ends, the deepest waiter goes first,
+  then the oldest.
+- An owner with no activity for 15 minutes, or a wait longer than
+  `slot_wait_minutes`, lets the waiter share the slot.
+
+The wait happens in the `model.request` hook, before opencode starts its
+request timer, so a wait never counts against the provider timeout. The
+slot count comes from `GET /slots` (Strata) or the unit's `--parallel`
+(llama.cpp). The slot gate works on v2 only. On v1 (the Mac host), the
+task tool blocks the parent, and the one-GPU guard below refuses a second
+local subagent until the first returns.
+
 An example unit ships in `examples/llama-server.service`. Sidekick model
 requirements: tool calling, reasoning, and a chat template that accepts
 `reasoning_effort` through `chat_template_kwargs` under `--jinja`.
@@ -326,9 +416,72 @@ harness is exactly the wrong shape for that, so there are two defenses:
    `"warn"` logs loudly and allows.
 
 `--parallel 1` also means concurrent local calls **queue** rather than
-overlap. Two parallel scouts are fine; eight are a stall. This is in the
-lead's prompt. Need real burst parallelism? Point `sidekick` at a cheap
-flash-class API model instead — that is exactly what that knob is for.
+overlap. The harness refuses a second local subagent while one is running,
+so dispatch one, wait for the return, then dispatch the next: a fan-out of
+six scouts is five refusals, not a queue. The paid oracle can run beside a
+local one. This is in the lead's prompt. Need real burst parallelism? Point
+`sidekick` at a cheap flash-class API model instead; that is exactly what
+that knob is for.
+
+## The gate (one queue for every client)
+
+`gate/gate.mjs` is a small proxy that sits in front of the model server
+(llama-swap, Strata or llama-server). Every model request from every client
+(opencode, a web UI, scripts) goes through one queue, one at a time, and a
+running request is never cut off. Requests are "owner" (yours) or "seat"
+(background agents, by header `X-Strata-Class: seat` or by an agent named
+like a file in `GATE_SEATS_DIR`). Owner requests go first, and after one
+ends seats wait a grace window (`OWNER_GRACE_S`, default 180 s), so a
+background prompt cannot replace the prompt cache between two of your steps.
+Waiting streams get keepalive comments. `GET /gate/status` shows the queue.
+
+Install: copy `gate/strata-gate.service` to `~/.config/systemd/user/`, set
+the ports in it, `systemctl --user enable --now strata-gate`, and point
+clients at the gate port. Tests: `node --test tests/gate.test.mjs`.
+
+With llama-swap behind the gate you can keep two profiles of the same 27B:
+a fast one with MTP and the vision projector (45K context), and a `-long`
+one (96K, q8_0 KV, no projector: it cannot see images). Set
+`long_context` in `fusion.jsonc` and the panel tells you when a session on
+the fast profile grows past the threshold and should move to `-long`.
+
+## Compaction limits
+
+opencode v2 compacts at `(limit.input || limit.context) - compaction.reserved`.
+The summary may use at most `min(limit.output, 32000, limit.context - start)`
+tokens. So set the start with `limit.input`, keep `limit.context` at the real
+server context, and leave room: a thinking model spends its budget before it
+writes the summary. `oc-fusion doctor` prints `compacts@X summary=Y` per model
+and flags a summary budget under 16000. Its "not-ok" is advice: it reads
+the server context from your unit or swap config, which can be wrong.
+
+## Turns report
+
+`oc-fusion turns [--hours N] [--dir D]` reads the local server's sessions
+and counts, per agent, tool calls, failures and wasted turns (permission
+rejects, tool errors, incomplete input), with the median step time and the
+minutes lost. On a local model each wasted turn costs 30 to 90 s, so this
+is the list of prompt and permission fixes worth doing first.
+
+## Skills and opt-in tools
+
+`scripts/install-skills.sh` installs Cloudflare's
+[security-audit skill](https://github.com/cloudflare/security-audit-skill)
+(MIT) into `~/.config/opencode/skills/`, pinned to a reviewed commit
+(override with `SECURITY_AUDIT_REV`). Ask the critic or oracle for a
+security review and opencode loads it.
+
+`opencode.jsonc` carries a disabled `executor` MCP entry
+([executor](https://github.com/UsefulSoftwareCo/executor), MIT). It is off
+by default. To try it, `npm i -g executor@1.6.11`, set `"enabled": true`,
+and compare `oc-fusion turns` before and after.
+
+## CI
+
+`.github/workflows/ci.yml` runs on every push and PR: a privacy scan
+(`scripts/privacy-scan.sh`: home paths, LAN and tailnet addresses, keys),
+shell and Python syntax checks, and `node --test tests/`. A line that must
+keep a flagged pattern carries `privacy-scan: ok`.
 
 ## Evidence routing
 
@@ -392,7 +545,7 @@ brief asks for.
 ## Graft (the repo graph)
 
 [Graft](https://github.com/trailhq/Graft) is the third tier: a repo context
-graph as a folder of linked markdown — a local, regenerable cache that every
+graph as a folder of linked markdown: a local, regenerable cache that every
 query keeps in sync with the code. It is part of the setup, not an add-on:
 the graph lives in **your project**, never in the harness, and its core
 needs no LLM and no key. Agents use the graft tools first and fall back to
@@ -400,8 +553,8 @@ grep only where a project has no `graft/` index yet.
 
 - **Install once, globally**: `npm install -g @nanonets/graft` (Node 20+).
   On a new machine, `oc-fusion doctor` nags you until it's there.
-- **Build in the project you work in**: `graft build`. The structural pass —
-  wiring graph plus per-file cards — is $0 and keyless. `--deep` adds the
+- **Build in the project you work in**: `graft build`. The structural pass
+  (wiring graph plus per-file cards) is $0 and keyless. `--deep` adds the
   LLM concept map and per-symbol summaries; it needs a provider key, and
   nothing in this harness runs it automatically.
 - **Query locally**: `graft ask "..."`, `graft grep <pattern>`, `graft map`,
@@ -410,17 +563,17 @@ grep only where a project has no `graft/` index yet.
 - **MCP**: `opencode.jsonc` registers `graft mcp` as a local stdio server,
   launched through the same offline wrapper as the CLI (below). OpenCode
   starts it with the session's project directory as its cwd, so it indexes
-  whatever repo you have open — no path is hardcoded, and the harness
+  whatever repo you have open: no path is hardcoded, and the harness
   directory is never the target. The agents then get `graft_repo_map`,
   `graft_find_code`, `graft_find_all`, `graft_trace_calls`, `graft_file_api`
   and `graft_check_freshness`. In a project with no `graft/` index the
   server starts and advertises no tools; the agents fall back to grep and
   scout.
-- **CLI fallback**: the same queries run from the shell — `oc-fusion graft
-  map`, `oc-fusion graft ask "..."` — forwarded to the `graft` CLI in your
+- **CLI fallback**: the same queries run from the shell (`oc-fusion graft
+  map`, `oc-fusion graft ask "..."`), forwarded to the `graft` CLI in your
   current project, not the harness root.
-- **Privacy**: every graft process Fusion starts — MCP server or CLI
-  forward — runs through a Linux `unshare` wrapper that removes network
+- **Privacy**: every graft process Fusion starts (MCP server or CLI
+  forward) runs through a Linux `unshare` wrapper that removes network
   access for the process **and its children** (Graft's daily npm update
   check survives `DO_NOT_TRACK` otherwise), sets `DO_NOT_TRACK=1` for its
   anonymous usage stats, and refuses `--deep` so no provider-backed LLM
@@ -434,8 +587,8 @@ every other config change in this harness.
 ## rtk (the output tier)
 
 [rtk](https://github.com/rtk-ai/rtk) compresses command output before any
-agent reads it — `git status` to a stat line, test runs to failures only,
-listings to tree summaries — a single Rust binary, <10ms overhead. It is
+agent reads it (`git status` to a stat line, test runs to failures only,
+listings to tree summaries). A single Rust binary, <10ms overhead. It is
 part of the setup, and it covers **every** agent in the harness: lead,
 sidekick, subagents, because it rewrites at the Bash tool layer, not per
 agent.
@@ -444,19 +597,19 @@ agent.
   `cargo install --git https://github.com/rtk-ai/rtk`, or a prebuilt
   release binary). `oc-fusion doctor` reports it and nags until present.
 - **How it runs**: the vendored plugin
-  `.opencode/plugin/rtk.ts` (from rtk's own `rtk init -g --opencode`)
+  `plugins/rtk/index.ts` (from rtk's own `rtk init -g --opencode`)
   rewrites each Bash command via `rtk rewrite` before execution. No rtk in
   PATH → the plugin disables itself and commands run unchanged; a failed
   rewrite passes through. Nothing is written into your global config.
 - **What it saves**: the numbers rtk reports are reductions in **bash
-  output**, not in your bill — bash output is one contributor among
+  output**, not in your bill: bash output is one contributor among
   prompt, history, and output tokens. Percentages are reliable, absolute
   token counts are estimated (bytes/4).
 - **Division of labour**: rtk compresses at the source, before output
   reaches a model. The harness's `compress_tool_output` knob still exists
   for large-but-intact output rtk passes through (it runs after rtk, and
   only in paid sessions). Truncated-to-file output still goes to scout
-  with the path — that route is lossless and free. `rtk recall <id>`
+  with the path: that route is lossless and free. `rtk recall <id>`
   recovers the full output of a failed command rtk compacted.
 - **Privacy**: this rtk build ships no telemetry endpoint (verify with
   `rtk telemetry status`); its usage stats are local, and `rtk gain`
@@ -470,7 +623,7 @@ change in this harness.
 Every completed assistant message is logged to `.fusion/usage.jsonl` in the
 project directory: timestamp, session, agent, model, input/output/reasoning
 tokens, cache read/write, and cost. `oc-fusion usage` aggregates it per agent
-and prints a shadow line — what the delegated (non-lead) tokens would have
+and prints a shadow line: what the delegated (non-lead) tokens would have
 cost at lead rates. That shadow is the *ceiling* of what delegation saved,
 not a claim: it over-counts because a lead would not re-read everything the
 sidekick read, and local-agent `in` can under-count because llama.cpp bills
@@ -537,11 +690,15 @@ merely opening a session wakes the GPU to name a chat.
 fusion.jsonc               the control panel
 opencode.jsonc             providers, local aliases, agent definitions
 prompts/*.md               the five role prompts
-.opencode/plugin/fusion.js routing, the guard, effort injection, compression,
+plugins/fusion/index.js    routing, the guard, effort injection, compression,
                            discovery, accounting
-.opencode/plugin/rtk.ts    vendored rtk output-compression plugin (Bash rewrite)
+plugins/rtk/index.ts       vendored rtk output-compression plugin (Bash rewrite)
 bin/oc                     entry point
-bin/oc-fusion              panel CLI + doctor + usage + graft forwarder
+bin/oc-fusion              panel CLI + doctor + usage + turns + graft forwarder
+bin/oc-server              background server check and restart
+bin/oc-turns               wasted-turn report
+gate/                      strata-gate proxy and its user unit
+scripts/                   privacy scan, skill installer
 examples/llama-server.service  example local-server unit
 ```
 
@@ -559,4 +716,4 @@ affiliated with Cognition.
 
 ## License
 
-GPL-3.0 — see LICENSE.
+GPL-3.0: see LICENSE.

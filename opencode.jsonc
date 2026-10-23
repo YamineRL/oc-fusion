@@ -12,26 +12,41 @@
   // shared card free for work you actually asked for.
   "small_model": "merge-gateway/zai/glm-5.3-flash",
 
-  // Plugins auto-load from .opencode/plugin/ in alphabetical order, which
-  // puts fusion.js ahead of rtk.ts (fusion must see commands before rtk
-  // rewrites them). Keep the list empty: v2 only accepts directories here
-  // and drops file paths with a warning.
-  "plugin": [],
+  // `oc` runs opencode in your project, so the project's own .opencode/
+  // auto-discovery never finds the harness plugins: this list is what loads
+  // them. Paths are relative to this file. Entries are directories: v2 drops
+  // a file path with "configured plugin path must be a directory", and v1
+  // loads the directory's index. Order matters: fusion must see commands
+  // before rtk rewrites them. Keep plugin files out of .opencode/plugin/, or
+  // opencode in this repo loads them twice ("Duplicate plugin ID").
+  "plugin": ["./plugins/fusion", "./plugins/rtk"],
 
   // Fusion's efficiency comes from fewer, fatter round trips.
+  //   batch_tool / primary_tools: v1-only. v2 batches through the built-in
+  //   codemode "execute" tool instead, and the primary_tools effect lives in
+  //   the per-agent permissions below (only the lead may spawn subagents or
+  //   call escalate/work_order). The keys stay because the Mac host is v1;
+  //   the plugin audits them so they are documented, not silently dead.
+  //   subagent_depth lives under experimental so BOTH hosts read it: v2
+  //   drops the top-level key but honors this one. Subagents must not spawn
+  //   subagents: on --parallel 1 that deadlocks the single local slot.
   "experimental": {
     "batch_tool": true,
-    "primary_tools": ["task", "escalate", "work_order"]
+    "primary_tools": ["task", "escalate", "work_order"],
+    "subagent_depth": 1
   },
-
-  // Subagents must not spawn subagents: on --parallel 1 that deadlocks the
-  // single local slot behind itself.
-  "subagent_depth": 1,
 
   "compaction": {
     "auto": true,
+    // v1 flag; v2 drops it, so the fusion plugin prunes stale tool outputs
+    // itself on v2 (see plugins/fusion). Keep it: same file serves v1.
     "prune": true,
+    // v1 keeps the last N turns verbatim; v2 counts TOKENS instead and reads
+    // preserve_recent_tokens (mapped to keep.tokens). Both keys stay: turns
+    // and tokens are not convertible, so this is an honest budget, not a
+    // translation. 8000 tokens: a smaller tail leaves more working room.
     "tail_turns": 8,
+    "preserve_recent_tokens": 8000,
     "reserved": 8000
   },
 
@@ -50,6 +65,15 @@
   // server starts and advertises no tools; the agents fall back to grep/scout.
   // Restart opencode after any change to this block.
   "mcp": {
+    // Opt-in: executor (npm "executor", MIT) gives grunt/scout one typed
+    // tool surface instead of many shell calls. Off by default. To try it:
+    // `npm i -g executor@1.6.11`, set "enabled": true, then compare
+    // `oc-fusion turns` before and after.
+    "executor": {
+      "type": "local",
+      "command": ["executor", "mcp"],
+      "enabled": false
+    },
     "graft": {
       "type": "local",
       "command": ["oc-fusion", "graft", "mcp"],
@@ -68,8 +92,16 @@
       "npm": "@ai-sdk/openai-compatible",
       "name": "llama.cpp (local)",
       "options": {
-        "baseURL": "http://127.0.0.1:8080/v1",
-        "apiKey": "{file:~/.config/llama-server/api-key}"
+        // 2026-10-15: llama.cpp no longer owns a port of its own. llama-swap
+        // runs the process (stack/llama-swap) and strata-gate :8082 is the one
+        // queue in front of llama-swap :8091, so a client sends there and the
+        // wire id picks the engine. The old baseURL :8080 dialled the retired
+        // standalone llama-server, so this tier could not start.
+        "baseURL": "http://127.0.0.1:8082/v1",
+        // {file:} sends the whole file as one header. api-key has three lines
+        // (key, comment, key), which the gate answers with 400; line1 holds
+        // the key alone. The box config uses the same file.
+        "apiKey": "{file:~/.config/llama-server/api-key.line1}"
       },
       "models": {
         // "id" is a placeholder. The fusion plugin overwrites every local
@@ -128,8 +160,16 @@
       "models": {
         // `oc-fusion sidekick strata`: strata-iq3 is the general-model
         // alias. Run another quant (IQ3_S, IQ2_XS, ...)? Set "id" to the
-        // "model" /health reports and "limit.context" to its "max_context".
-        // The alias name stays the same.
+        // "model" /health reports. The alias name stays the same.
+        // limit.input sets when opencode compacts: at limit.input -
+        // compaction.reserved (~72k here). A fresh 88k-token read takes 5 to
+        // 9 minutes (log, 2026-10-16); with the prompt cache a step reads only
+        // the new tokens. At ~41k a session compacted every 8 steps
+        // (2026-10-16), so the start moved up. limit.context stays at Strata's max_context
+        // (98304): opencode 2.0.29 lets the summary use at most
+        // limit.context - that start point. With context 49152 that was
+        // 8000 tokens, less than Strata's 12288-token think, and the summary
+        // failed with "reached the output token limit" (2026-10-16).
         "strata-iq3": {
           "id": "qwen3.8-flash-next-iq3_xxs",
           "name": "Strata IQ3_XXS",
@@ -137,7 +177,7 @@
           "reasoning": true,
           "temperature": false,
           "options": { "reasoning_effort": "medium" },
-          "limit": { "context": 98304, "output": 16384 },
+          "limit": { "context": 98304, "input": 80000, "output": 32768 },
           "cost": { "input": 0, "output": 0 }
         },
         // `oc-fusion sidekick strata-coder`: Coder IQ1_M. Strata serves one
@@ -163,7 +203,9 @@
       "model": "merge-gateway/zai/glm-5.3",
       "variant": "high",
       "prompt": "{file:./prompts/fusion.md}",
-      "steps": 400,
+      // No "steps" here: under v2 a declared field beats the plugin's agent
+      // transform, and the plugin owns the step budget so /fusion speed
+      // (fast = 200, normal = 400) can change it without a restart.
       // The v2 runner gives an agent with no ruleset a deny-everything
       // default, so this block is load-bearing, not a nicety. Keep it in this
       // file rather than another config's agent map: a later config source's
@@ -172,12 +214,12 @@
       "permission": {
         "*": "allow",
         "doom_loop": "deny",
-        "external_directory": "ask",
+        "external_directory": "allow",
         "question": "allow"
       }
     },
     "scout": {
-      "description": "Read-only explorer on the local model. Use for finding files, tracing call sites, summarizing how something works. Returns findings, never patches.",
+      "description": "Read-only explorer on the local model. Read/glob/grep plus a narrow read-only shell (ls, rg, fd, cat, sed -n, wc, head, tail, git log/diff/show); no cd/find/awk/sort/uniq. Graft only on code with a built graph. Returns findings, never patches.",
       "mode": "subagent",
       // No "model" here on purpose, also for grunt and critic: under v2 a
       // model in this table beats the plugin, and the fusion plugin sets
@@ -188,6 +230,16 @@
       "permission": {
         "edit": "deny",
         "write": "deny",
+        // Lead-only tools (v1 primary_tools, v2 per-agent permissions):
+        // a sidekick seat may not spawn subagents, escalate or file orders.
+        "task": "deny",
+        "subagent": "deny",
+        "escalate": "deny",
+        "work_order": "deny",
+        // Read-only shell only. cd/find/awk/sort/uniq and pipelines that
+        // start with a denied command are not in this list. Scout's prompt
+        // says to use absolute paths and rg/glob for counts, so a brief that
+        // names a denied command does not become a retry loop.
         "bash": {
           "*": "deny",
           "git log*": "allow", "git diff*": "allow", "git show*": "allow",
@@ -216,8 +268,13 @@
       "permission": {
         "*": "allow",
         "doom_loop": "deny",
-        "external_directory": "ask",
-        "question": "allow"
+        "external_directory": "allow",
+        "question": "allow",
+        // Lead-only tools: no nested subagents, no escalation, no orders.
+        "task": "deny",
+        "subagent": "deny",
+        "escalate": "deny",
+        "work_order": "deny"
       }
     },
     "oracle": {
@@ -227,14 +284,58 @@
       "variant": "max",
       "prompt": "{file:./prompts/oracle.md}",
       "steps": 40,
-      "permission": { "edit": "deny", "write": "deny" }
+      "permission": {
+        "edit": "deny",
+        "write": "deny",
+        // Read-only reasoning: the same narrow shell as scout. No writes by
+        // proxy, and no cd/find/awk/sort/uniq.
+        "bash": {
+          "*": "deny",
+          "git log*": "allow", "git diff*": "allow", "git show*": "allow",
+          "rg *": "allow", "grep *": "allow", "fd *": "allow",
+          "ls *": "allow", "cat *": "allow", "sed -n *": "allow",
+          "wc *": "allow", "head *": "allow", "tail *": "allow",
+          "oc-fusion graft ask*": "allow",
+          "oc-fusion graft grep*": "allow",
+          "oc-fusion graft skeleton*": "allow",
+          "oc-fusion graft callers*": "allow",
+          "oc-fusion graft map*": "allow",
+          "oc-fusion graft check*": "allow"
+        },
+        "task": "deny",
+        "subagent": "deny",
+        "escalate": "deny",
+        "work_order": "deny"
+      }
     },
     "critic": {
       "description": "Reviews a diff for correctness before you call the work done.",
       "mode": "subagent",
       "prompt": "{file:./prompts/critic.md}",
       "steps": 40,
-      "permission": { "edit": "deny", "write": "deny" }
+      "permission": {
+        "edit": "deny",
+        "write": "deny",
+        // Read-only review: the same narrow shell as scout. A review cannot
+        // write through bash, and no cd/find/awk/sort/uniq.
+        "bash": {
+          "*": "deny",
+          "git log*": "allow", "git diff*": "allow", "git show*": "allow",
+          "rg *": "allow", "grep *": "allow", "fd *": "allow",
+          "ls *": "allow", "cat *": "allow", "sed -n *": "allow",
+          "wc *": "allow", "head *": "allow", "tail *": "allow",
+          "oc-fusion graft ask*": "allow",
+          "oc-fusion graft grep*": "allow",
+          "oc-fusion graft skeleton*": "allow",
+          "oc-fusion graft callers*": "allow",
+          "oc-fusion graft map*": "allow",
+          "oc-fusion graft check*": "allow"
+        },
+        "task": "deny",
+        "subagent": "deny",
+        "escalate": "deny",
+        "work_order": "deny"
+      }
     }
   }
 }

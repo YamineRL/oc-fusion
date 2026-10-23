@@ -13,6 +13,13 @@
 // one mid-generation. Every local alias therefore sends the same wire id, and
 // the guard below refuses (or warns about) anything else.
 //
+// Discovery follows the machine. With a systemd unit the unit is parsed for
+// flags and `ps` finds the resident model. Without one (macOS, or a server
+// on another host reached over a tunnel), or when FUSION_BASE_URL is set,
+// the endpoint itself answers: /v1/models for residency, /props for the
+// context, panel keys for the rest. All passive GETs, so none can trigger
+// a load.
+//
 // Dual plugin shape: OpenCode v2 calls `default.setup(context)`; v1 hosts
 // call `default.server(input)` (detect mode) or the named `server` export
 // (iterating loaders). Both bodies share `resolveFusion(directory)` below so
@@ -22,12 +29,18 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { spawn, spawnSync } from "node:child_process";
+import { pathToFileURL } from "node:url";
 import {
   normalizeCommand,
   isVerificationCommand,
   extractFilePath,
   makeControllerState,
   recordEdit,
+  recordBlocked,
+  isLocalSubagent,
+  gateSubagent,
+  startSubagent,
+  endSubagent,
   recordCommandResult,
   recordVerification,
   failSignature,
@@ -38,6 +51,26 @@ import {
   renderResultEnvelope,
   renderControllerState,
 } from "./controller-lib.mjs";
+import { makeSlotGate } from "./slot-gate.mjs";
+import {
+  FUSION_RPC,
+  KNOBS,
+  EFFORT_SEATS,
+  EFFORT_LEVELS,
+  makeNotice,
+  makeNoticeStore,
+  readPendingFile,
+  clearPendingFile,
+  findDroppedKeys,
+  LOCAL_PROVIDER_IDS,
+  writePanelKey,
+  writePanelEffort,
+  usageTotals,
+  readUsageRows,
+  pruneOldToolOutputs,
+  LEAD_RATES,
+  longContextHint,
+} from "./panel.mjs";
 
 // Machine-specific locations, overridable. Defaults follow XDG.
 const UNIT = process.env.FUSION_UNIT ?? path.join(os.homedir(), ".config/systemd/user/llama-server.service");
@@ -49,8 +82,10 @@ const STRATA_KEY_FILE = process.env.FUSION_STRATA_KEY_FILE ?? path.join(os.homed
 
 // Providers that run on your own hardware. Both get the per-agent
 // local_efforts and the sampler strip; only llamacpp gets the resident-id
-// rewrite, the eviction guard and the context clamp.
-const LOCAL_PROVIDERS = ["llamacpp", "strata"];
+// rewrite, the eviction guard and the context clamp. The id list lives in
+// panel.mjs because the dropped-key audit needs it too: a model option key
+// is only provably dead on the providers the plugin owns on the wire.
+const LOCAL_PROVIDERS = LOCAL_PROVIDER_IDS;
 
 // ---------------------------------------------------------------- base models
 
@@ -132,6 +167,15 @@ const DEFAULTS = {
   // rather than falling back, so adjust to your model.
   local_efforts: { scout: "low", grunt: "medium", critic: "high" },
 
+  // Remote llama.cpp only (no systemd unit, or FUSION_BASE_URL set): what
+  // HTTP cannot report. local_ctx is the server's TOTAL context (null =
+  // read the per-slot context from GET /props), local_parallel its
+  // --parallel, server_effort the fallback reasoning_effort for local
+  // agents missing from local_efforts.
+  local_ctx: null,
+  local_parallel: null,
+  server_effort: null,
+
   // Evidence routing. The runtime measures stalls and scope instead of asking
   // the lead to estimate hardness, and keeps the counters in plugin memory +
   // .fusion/control.jsonl so compaction cannot prune them away.
@@ -154,6 +198,25 @@ const DEFAULTS = {
   // Repo-relative prefixes sidekick agents may never edit, whatever the
   // measurements say. Migrations, secrets-adjacent config, deploy manifests.
   protected_paths: [],
+  // When the configured sidekick's backend stops answering (passive probe:
+  // /health or /v1/models, never a model-named request), sidekick and critic
+  // work reroutes to this fallback until the backend is back. Any name from
+  // the sidekick list works; a paid model means downtime costs money.
+  // null = no fallback, sidekick calls fail visibly instead.
+  sidekick_fallback: "glm",
+  // One session at a time on a one-slot local backend (Strata, llama-server
+  // with --parallel 1). Without it a lead and its background subagent take
+  // turns, each request removes the other's prompt cache, and long prompts
+  // never finish (2026-10-09). The owner keeps the backend until its run
+  // ends; a subagent goes before its parent. slot_wait_minutes caps one
+  // wait: after it the request goes anyway.
+  slot_gate: true,
+  slot_wait_minutes: 60,
+  // Hint, never a switch: when a session on a short-context model nears its
+  // compaction point, name a long-context model to move to. One model swap
+  // (about 40 s) costs less than a run of compactions (minutes each).
+  // Shape: { "model": "<id or part of it>", "at": <tokens>, "switch_to": "<provider/model>" }
+  long_context: null,
 };
 
 // ------------------------------------------------------------------- helpers
@@ -181,7 +244,7 @@ function stripJsonc(text) {
 }
 
 // The harness root, i.e. where this plugin lives, two levels up from
-// .opencode/plugin/. Used so the control panel is found when opencode runs in
+// plugins/fusion/. Used so the control panel is found when opencode runs in
 // some other repo rather than in the harness directory itself.
 const HARNESS = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..", "..");
 
@@ -196,12 +259,33 @@ function readProfile(dir) {
   ];
   for (const p of candidates) {
     try {
-      if (fs.existsSync(p)) return { ...DEFAULTS, ...JSON.parse(stripJsonc(fs.readFileSync(p, "utf8"))) };
+      if (fs.existsSync(p)) {
+        // The file that won decides where /fusion set commands write.
+        lastProfileFile = p;
+        return { ...DEFAULTS, ...JSON.parse(stripJsonc(fs.readFileSync(p, "utf8"))) };
+      }
     } catch (e) {
       console.error(`[fusion] ${path.basename(p)} is not valid JSON, using defaults: ${e.message}`);
     }
   }
+  lastProfileFile = null;
   return { ...DEFAULTS };
+}
+// The file the last readProfile call loaded (null when defaults only).
+let lastProfileFile = null;
+
+// The config files opencode could have loaded, in precedence order: the
+// project first, then the file OPENCODE_CONFIG names (the harness config
+// when run through `oc`), then the global config.
+function configCandidates(directory) {
+  const home = os.homedir();
+  return [
+    path.join(directory, "opencode.json"),
+    path.join(directory, "opencode.jsonc"),
+    ...(process.env.OPENCODE_CONFIG ? [process.env.OPENCODE_CONFIG] : []),
+    path.join(home, ".config", "opencode", "opencode.json"),
+    path.join(home, ".config", "opencode", "opencode.jsonc"),
+  ];
 }
 
 // Registry id -> declared wire id for one provider's models, read straight
@@ -211,13 +295,7 @@ function readProfile(dir) {
 // plugins, so the model map is always empty when a file plugin's transform
 // runs. The project config wins over the global one.
 function readConfigWireIds(directory, providerID) {
-  const home = os.homedir();
-  const candidates = [
-    path.join(directory, "opencode.json"),
-    path.join(directory, "opencode.jsonc"),
-    path.join(home, ".config", "opencode", "opencode.json"),
-    path.join(home, ".config", "opencode", "opencode.jsonc"),
-  ];
+  const candidates = configCandidates(directory);
   const wire = new Map();
   for (const p of candidates) {
     try {
@@ -229,6 +307,20 @@ function readConfigWireIds(directory, providerID) {
     } catch { /* absent or unparsable config is not a plugin problem */ }
   }
   return wire;
+}
+
+// One provider's configured baseURL, from the same config files. Remote
+// mode needs it: with no unit to parse, the endpoint is the only place the
+// server's address is written down.
+function readConfigBaseURL(directory, providerID) {
+  for (const p of configCandidates(directory)) {
+    try {
+      const cfg = JSON.parse(stripJsonc(fs.readFileSync(p, "utf8")));
+      const u = cfg?.provider?.[providerID]?.options?.baseURL;
+      if (u) return String(u);
+    } catch { /* absent or unparsable config is not a plugin problem */ }
+  }
+  return null;
 }
 
 // Key files are one key per line; # lines are comments. Take the first usable
@@ -334,14 +426,99 @@ function residentModels() {
   }
 }
 
+// ------------------------------------------- remote endpoint as source of truth
+
+// Remote mode: no systemd unit exists to parse (the server runs on another
+// host, or FUSION_BASE_URL names it directly). Everything the unit used to
+// tell us then comes from the endpoint and the panel: the port from the
+// base URL, ctx/parallel from the panel keys (GET /props fills what they
+// leave null), the effort fallback from "server_effort".
+function readEndpointConfig(profile, baseURL) {
+  const out = { ctx: null, port: null, modelsDir: null, modelsMax: null, parallel: null, effort: null, idle: null };
+  const m = String(baseURL ?? "").match(/:(\d+)/);
+  if (m) out.port = Number(m[1]);
+  if (profile?.local_ctx) out.ctx = Number(profile.local_ctx) || null;
+  if (profile?.local_parallel) out.parallel = Number(profile.local_parallel) || null;
+  if (profile?.server_effort) out.effort = profile.server_effort;
+  return out;
+}
+
+async function fetchJson(url, key, timeoutMs = 4000) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, {
+      headers: key ? { Authorization: `Bearer ${key}` } : {},
+      signal: ctrl.signal,
+    });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// The resident model(s) on a remote llama-server, read passively:
+// GET /v1/models only, never a completion, so it cannot trigger a load.
+// Router-mode servers report status.value per model ("loaded" | "unloaded"
+// | ...) plus the child server's args; a vanilla server lists only what it
+// has loaded, so a bare entry counts as resident.
+async function remoteResidentModels(baseURL, key) {
+  const found = new Map();
+  const origin = String(baseURL ?? "").replace(/\/v1\/?$/, "");
+  if (!origin) return found;
+  const doc = await fetchJson(`${origin}/v1/models`, key);
+  for (const m of doc?.data ?? []) {
+    if (!m?.id) continue;
+    const status = m.status?.value ? String(m.status.value).toLowerCase() : null;
+    if (status && !["loaded", "loading", "ready", "sleeping"].includes(status)) continue;
+    // Child-server args are a flat argv list; pull --ctx-size/--parallel out.
+    const args = Array.isArray(m.status?.args) ? m.status.args : [];
+    const flag = (f) => {
+      const i = args.indexOf(f);
+      return i >= 0 && i + 1 < args.length ? Number(args[i + 1]) || null : null;
+    };
+    found.set(String(m.id), { ctx: flag("--ctx-size"), parallel: flag("--parallel") });
+  }
+  return found;
+}
+
 // ------------------------------------------------- shared setup (both hosts)
 
 // Everything the two plugin bodies need that does not depend on the host's
 // hook API: profile resolution, local-server discovery, controller state,
 // graft helpers, work orders, the escalate/summarize machinery, the banner.
-function resolveFusion(directory) {
+async function resolveFusion(directory) {
   const profile = readProfile(directory);
-  const unit = readUnit();
+
+  // Where llama-server lives decides how it is discovered. With a systemd
+  // unit the unit is the contract. Without one (macOS, a remote box reached
+  // over a tunnel), or when FUSION_BASE_URL is set, the endpoint answers:
+  // /v1/models for residency, /props for the context, the panel keys for
+  // the rest. All passive GETs; none names a model, so none can load one.
+  const forcedBase = process.env.FUSION_BASE_URL || null;
+  const remote = Boolean(forcedBase) || !fs.existsSync(UNIT);
+  const llamaBase = remote ? forcedBase ?? readConfigBaseURL(directory, "llamacpp") : null;
+  const llamaOrigin = llamaBase ? llamaBase.replace(/\/v1\/?$/, "") : null;
+  const unit = remote ? readEndpointConfig(profile, llamaBase) : readUnit();
+
+  let llamaKey = null;
+  if (remote) {
+    try { llamaKey = readKeyFile(API_KEY_FILE); } catch { /* absent key: probes below just fail closed */ }
+  }
+  const resident = remote ? await remoteResidentModels(llamaBase, llamaKey) : residentModels();
+  // /props reports the per-slot context and the slot count; use it for what
+  // the panel left null. ctx stays a TOTAL so the per-slot clamp below
+  // divides the same way as with a unit.
+  if (remote && llamaOrigin && (unit.ctx == null || unit.parallel == null)) {
+    const props = await fetchJson(`${llamaOrigin}/props`, llamaKey);
+    const slotCtx = props?.default_generation_settings?.n_ctx_slot ?? props?.n_ctx_slot ?? null;
+    const slots = Number(props?.total_slots) || null;
+    if (unit.ctx == null && slotCtx) unit.ctx = slotCtx * (slots || 1);
+    if (unit.parallel == null) unit.parallel = slots;
+  }
 
   const base = BASES[profile.base] ?? BASES[DEFAULTS.base];
   if (!BASES[profile.base]) {
@@ -395,7 +572,6 @@ function resolveFusion(directory) {
     return fast && String(agent) === "scout" ? "low" : asked;
   }
 
-  const resident = residentModels();
   // The wire id every local alias sends: pinned via the panel, else whatever
   // the running server has resident. Discovery means the harness cannot ask
   // the server for a model it does not have loaded.
@@ -668,7 +844,11 @@ function resolveFusion(directory) {
       );
     }
     if (unit.ctx && usesLlama) {
-      console.error(`[fusion] llama-server unit: ctx ${unit.ctx}, parallel ${unit.parallel}, models-max ${unit.modelsMax}, idle-sleep ${unit.idle}s`);
+      console.error(
+        remote
+          ? `[fusion] llama-server endpoint ${llamaBase}: ctx ${unit.ctx}, parallel ${unit.parallel ?? "?"}`
+          : `[fusion] llama-server unit: ctx ${unit.ctx}, parallel ${unit.parallel}, models-max ${unit.modelsMax}, idle-sleep ${unit.idle}s`,
+      );
     }
     if (sidekickIsLlama && resident.size && !resident.has(localWireId)) {
       console.error(`[fusion] WARNING: sidekick wants "${localWireId}" but resident is "${[...resident.keys()].join(", ")}". First sidekick call will evict it.`);
@@ -929,7 +1109,10 @@ function resolveFusion(directory) {
       // the alias cannot evict anything.
       model = sidekick.slice(sidekick.indexOf("/") + 1);
     } else {
-      base = `http://127.0.0.1:${unit.port ?? 8080}`;
+      base = remote ? llamaOrigin : `http://127.0.0.1:${unit.port ?? 8080}`;
+      if (!base) {
+        throw new Error("no llama-server endpoint: no unit, no FUSION_BASE_URL, no provider.llamacpp baseURL");
+      }
       key = readKeyFile(API_KEY_FILE);
       // Same rule as the wire stamp: a load-time name can be stale, so the
       // resident model is re-read here. A bad read means no summarizer call.
@@ -972,8 +1155,17 @@ function resolveFusion(directory) {
   }
 
   return {
-    profile, unit, base, oracleBase, oracleEffort, fast, leadEffort, leadModel,
-    sidekick, sidekickIsLocal, sidekickIsLlama, criticPatch, resident, localWireId, localRuntime,
+    profile, unit, remote, llamaBase, llamaOrigin,
+    // Strata's address comes from the same config files the server reads;
+    // STRATA_URL is the fallback for the summarizer path only. Provider
+    // baseURLs conventionally end in /v1; the health endpoint does not.
+    strataBase: (readConfigBaseURL(directory, "strata") ?? STRATA_URL).replace(/\/v1\/?$/, ""),
+    // The file /fusion set commands write back to (null = defaults only).
+    profileFile: lastProfileFile,
+    directory,
+    base, oracleBase, oracleEffort, fast, leadEffort, leadModel,
+    sidekick, sidekickIsLocal, sidekickIsLlama, sidekickIsStrata, criticPatch, resident, localWireId, localRuntime,
+    providerOf,
     cfgWireIds, readResidentLive, pickWireId, effortFor,
     ctrl, fusionDir, controlLog, ordersFile, inboxDir, outboxDir,
     logControl, graftBin, hasGraft, graftJson, fileScope, blastTick,
@@ -989,8 +1181,28 @@ function resolveFusion(directory) {
 // returned hook object. Kept because the Mac still runs v1; the file stays
 // one source of truth for both versions.
 
+// v1 only. The plugin lives in plugins/fusion/, so no node_modules is on its
+// resolve path. v1 installs @opencode-ai/plugin into its global config dir
+// (and into a .opencode/ it loads), so look there when the bare import fails.
+async function importPluginSdk() {
+  try {
+    return await import("@opencode-ai/plugin");
+  } catch (err) {
+    const configHome = process.env.XDG_CONFIG_HOME || path.join(os.homedir(), ".config");
+    for (const base of [path.join(HARNESS, ".opencode"), path.join(configHome, "opencode")]) {
+      const dir = path.join(base, "node_modules", "@opencode-ai", "plugin");
+      try {
+        const pkg = JSON.parse(fs.readFileSync(path.join(dir, "package.json"), "utf8"));
+        const entry = pkg.exports?.["."]?.import ?? pkg.module ?? pkg.main ?? "index.js";
+        return await import(pathToFileURL(path.join(dir, entry)).href);
+      } catch {}
+    }
+    throw err;
+  }
+}
+
 export const server = async ({ directory }) => {
-  const F = resolveFusion(directory);
+  const F = await resolveFusion(directory);
   const {
     profile, unit, oracleBase, oracleEffort, fast, leadEffort, leadModel,
     sidekick, sidekickIsLocal, sidekickIsLlama, criticPatch, resident, localWireId, localRuntime,
@@ -999,7 +1211,7 @@ export const server = async ({ directory }) => {
     listInbox, stallsSummary, appendUsage, banner, printBanner,
     escalateImpl, workOrderImpl, localSummarize, effortFor,
   } = F;
-  const { tool } = await import("@opencode-ai/plugin");
+  const { tool } = await importPluginSdk();
 
   // Track which agent owns a session so tool-output compression only fires
   // for the paid tiers. tool.execute.after does not carry the agent itself.
@@ -1015,6 +1227,7 @@ export const server = async ({ directory }) => {
   function gate(callID, kind, reason, extra = {}) {
     logControl({ kind: profile.routing === "enforce" ? `${kind}-blocked` : `${kind}-observed`, ...extra, reason });
     if (profile.routing === "enforce") {
+      recordBlocked(ctrl, extra.tool ?? kind, kind, reason);
       throw new Error(`[fusion routing] ${reason}`);
     }
     if (ctrl.notices.size > 200) ctrl.notices.delete(ctrl.notices.keys().next().value);
@@ -1280,7 +1493,17 @@ export const server = async ({ directory }) => {
       const args = output?.args ?? {};
 
       if (input.tool === "task") {
-        logControl({ kind: "dispatch", session: input.sessionID, agent, to: args.subagent_type ?? args.agent ?? "?", desc: String(args.description ?? "").slice(0, 120) });
+        const to = args.subagent_type ?? args.agent ?? "?";
+        logControl({ kind: "dispatch", session: input.sessionID, agent, to, desc: String(args.description ?? "").slice(0, 120) });
+        // One GPU: blocks in every routing mode, not only enforce.
+        const local = isLocalSubagent(to, { sidekickIsLocal, criticModel: criticPatch.model, localProviders: LOCAL_PROVIDERS });
+        const busy = gateSubagent(ctrl, to, local);
+        if (busy) {
+          logControl({ kind: "one-gpu-blocked", to, reason: busy });
+          recordBlocked(ctrl, "task", "one-gpu", busy);
+          throw new Error(`[fusion] ${busy}`);
+        }
+        if (local) startSubagent(ctrl, input.callID, to);
         return;
       }
 
@@ -1329,6 +1552,7 @@ export const server = async ({ directory }) => {
     // in a paid context. Head and tail are kept verbatim so nothing the model
     // needs to quote exactly is silently lost.
     "tool.execute.after": async (input, output) => {
+      if (input.tool === "task") endSubagent(ctrl, input.callID);
       if (typeof output.output !== "string") return;
       let text = output.output;
 
@@ -1488,19 +1712,178 @@ export const server = async ({ directory }) => {
 
 const setupV2 = async (ctx) => {
   const directory = ctx.location.directory;
-  const F = resolveFusion(directory);
+  let F = await resolveFusion(directory);
+  // S() is the live profile view: hooks read through it so a `/fusion set`
+  // (or a config edit + registry reload) changes behavior on the next
+  // request, not on a server restart.
+  const S = () => F;
+  const refresh = async () => {
+    const prev = F;
+    F = await resolveFusion(directory);
+    // Controller counters, the scope cache and the blast counter are
+    // session state, not config: they survive a profile change.
+    F.ctrl = prev.ctrl;
+    F.fileScope = prev.fileScope;
+    F.blastTick = prev.blastTick;
+  };
   const {
-    profile, unit, oracleBase, oracleEffort, fast, leadEffort, leadModel,
-    sidekick, sidekickIsLocal, sidekickIsLlama, criticPatch, resident, localWireId, localRuntime,
-    cfgWireIds, readResidentLive, pickWireId, effortFor,
-    ctrl, inboxDir, outboxDir, logControl, graftBin, hasGraft, fileScope,
+    ctrl, inboxDir, outboxDir, fusionDir, logControl, graftBin, hasGraft, fileScope,
     blastTick, measureFileScope, measureDiffScope, readOrders, writeOrders,
-    listInbox, stallsSummary, appendUsage, banner, printBanner,
-    escalateImpl, workOrderImpl, localSummarize,
+    listInbox, stallsSummary, appendUsage,
   } = F;
 
-  printBanner();
+  F.printBanner();
   const registrations = [];
+
+  // -------------------------------------------------- notices (TUI side)
+  //
+  // Every harness failure a TUI user must see becomes a notice: kind, one
+  // sentence about what happened, one action that fixes or routes around
+  // it. Deduped by id for the life of this server; emitted live over RPC
+  // and queued so a TUI that connects later still gets them.
+  const notices = makeNoticeStore();
+  const pendingFile = path.join(fusionDir, "pending-notices.jsonl");
+  let rpcEvents = null;
+  const emitNotice = (kind, message, action, extra = {}) => {
+    const n = makeNotice(kind, message, action, extra);
+    if (!notices.offer(n)) return n;
+    logControl({ kind: "notice", notice: n.kind, session: n.sessionID, message: n.message });
+    if (rpcEvents) void rpcEvents.emit("notice", n).catch(() => {});
+    return n;
+  };
+  // bin/oc-server writes launch-time findings (version skew, missing
+  // backends) here because its warnings go to a stderr the TUI never shows.
+  const drainPendingFile = () => {
+    for (const n of readPendingFile(pendingFile)) {
+      emitNotice(n.kind ?? "external", n.message, n.action, n);
+    }
+    clearPendingFile(pendingFile);
+  };
+  drainPendingFile();
+
+  // ------------------------------------------------ backend health + fallback
+  //
+  // Probes are passive only: /v1/models and /health never name a model, so
+  // they cannot load or evict one. Results cache briefly; down answers
+  // expire faster so a recovering backend gets retried soon.
+  const health = {
+    llamacpp: { ok: null, at: 0 },
+    strata: { ok: null, at: 0 },
+  };
+  const backendDown = { llamacpp: false, strata: false };
+  const HEALTH_TTL_UP_MS = 30_000;
+  const HEALTH_TTL_DOWN_MS = 10_000;
+
+  const checkBackend = async (providerID, { force = false } = {}) => {
+    const h = health[providerID];
+    const ttl = h.ok === false ? HEALTH_TTL_DOWN_MS : HEALTH_TTL_UP_MS;
+    if (!force && h.ok !== null && Date.now() - h.at < ttl) return h.ok;
+    let ok = false;
+    try {
+      if (providerID === "llamacpp") {
+        const base = S().llamaBase ?? `http://127.0.0.1:${S().unit.port ?? 8080}`;
+        ok = (await S().readResidentLive(base, {})) !== null;
+      } else {
+        const base = S().strataBase;
+        const res =
+          (await fetch(`${base}/health`, { signal: AbortSignal.timeout(2500) }).catch(() => null)) ??
+          (await fetch(`${base}/v1/models`, {
+            headers: { authorization: `Bearer ${readKeyFile(STRATA_KEY_FILE)}` },
+            signal: AbortSignal.timeout(2500),
+          }).catch(() => null));
+        ok = Boolean(res?.ok);
+      }
+    } catch {
+      ok = false;
+    }
+    h.ok = ok;
+    h.at = Date.now();
+    return ok;
+  };
+
+  const markBackend = (providerID, down, detail = "") => {
+    if (backendDown[providerID] === down) return;
+    backendDown[providerID] = down;
+    const name = providerID === "strata" ? "Strata" : "llama-server";
+    if (down) {
+      const fb = S().profile.sidekick_fallback;
+      emitNotice(
+        "backend-down",
+        `${name} is not answering${detail ? ` (${detail})` : ""}.`,
+        fb
+          ? `Sidekick work now goes to the "${fb}" fallback until ${name} is back.`
+          : `Start ${name}, or set "sidekick_fallback" in fusion.jsonc so work can continue.`,
+        { severity: "error" },
+      );
+    } else {
+      emitNotice("backend-up", `${name} is answering again.`, "Sidekick work is back on the local model.", {
+        severity: "info",
+      });
+    }
+    // Replay the agent transform so sidekick/critic seats reroute (or
+    // reroute back) immediately, not on the next restart.
+    void ctx.agent.reload?.().catch?.(() => {});
+    void ctx.model.reload?.().catch?.(() => {});
+  };
+
+  // Sidekick seats the profile actually routes to each local backend.
+  const localSeatsUse = (providerID) => {
+    const { sidekick, criticPatch, providerOf } = S();
+    return providerOf(sidekick) === providerID || providerOf(criticPatch.model) === providerID;
+  };
+
+  // Initial probes run in parallel; a down backend flips its seats to the
+  // fallback before the first request lands.
+  await Promise.all(
+    LOCAL_PROVIDERS.map(async (providerID) => {
+      if (!localSeatsUse(providerID)) return;
+      const ok = await checkBackend(providerID, { force: true });
+      if (!ok) markBackend(providerID, true, "health probe failed");
+    }),
+  );
+
+  // Recovery probe: a down backend is re-probed quietly; an answering one
+  // flips the seats back and emits a single "back up" notice.
+  const healthTimer = setInterval(() => {
+    for (const providerID of LOCAL_PROVIDERS) {
+      if (!backendDown[providerID]) continue;
+      void checkBackend(providerID, { force: true }).then((ok) => {
+        if (ok) markBackend(providerID, false);
+      });
+    }
+  }, HEALTH_TTL_UP_MS);
+  healthTimer.unref?.();
+
+  // ----------------------------------------------- dropped-settings scan
+  //
+  // opencode 2.x normalizes the config and silently drops keys v1 honored.
+  // Keys the harness keeps deliberately (v1 still runs on the Mac) are
+  // audited and listed in the status output; anything else dropped gets a
+  // one-time notice, because a dead setting that looks live is a lie.
+  const configAudit = (() => {
+    const audited = new Set();
+    const unaudited = new Set();
+    let pruneEnabled = false;
+    for (const cfgPath of configCandidates(directory)) {
+      try {
+        const cfg = JSON.parse(stripJsonc(fs.readFileSync(cfgPath, "utf8")));
+        if (cfg?.compaction?.prune === true) pruneEnabled = true;
+        const r = findDroppedKeys(cfg);
+        for (const k of r.audited) audited.add(k);
+        for (const k of r.unaudited) unaudited.add(k);
+      } catch {
+        /* absent or unparsable config is not a plugin problem */
+      }
+    }
+    return { audited: [...audited].sort(), unaudited: [...unaudited].sort(), pruneEnabled };
+  })();
+  if (configAudit.unaudited.length) {
+    emitNotice(
+      "dropped-settings",
+      `opencode v2 ignores ${configAudit.unaudited.length} setting(s) in the config: ${configAudit.unaudited.slice(0, 4).join(", ")}${configAudit.unaudited.length > 4 ? ", …" : ""}.`,
+      "They do nothing here. Remove them, or run /fusion status for the full list.",
+    );
+  }
 
   // "provider/model" spec -> Model.Ref {providerID, id, variant?}
   const splitModel = (spec) => {
@@ -1523,6 +1906,7 @@ const setupV2 = async (ctx) => {
   // (see http.request below).
 
   await ctx.agent.transform((editor) => {
+    const { profile, fast, leadModel, leadEffort, oracleBase, oracleEffort, sidekick, criticPatch, effortFor } = S();
     const seat = (id, fn) => editor.update(id, fn);
 
     seat("fusion", (a) => {
@@ -1541,14 +1925,27 @@ const setupV2 = async (ctx) => {
       seat("oracle", (a) => { a.hidden = true; });
     }
 
+    // Backend fallback: when a local backend is down and the panel names a
+    // fallback, sidekick seats reroute to it until the probe reports the
+    // backend back. A fallback that is itself a down local backend is not
+    // taken.
+    const reroute = (modelRef) => {
+      const down = modelRef?.providerID && backendDown[modelRef.providerID];
+      if (!down) return modelRef;
+      const fbSpec = profile.sidekick_fallback && SIDEKICKS[profile.sidekick_fallback];
+      if (!fbSpec) return modelRef;
+      const fbRef = refOf(fbSpec);
+      return backendDown[fbRef.providerID] ? modelRef : fbRef;
+    };
+
     // These writes stick only because opencode.jsonc names no model for
     // scout, grunt or critic: a model declared there beats this transform.
-    const sideRef = refOf(sidekick);
+    const sideRef = reroute(refOf(sidekick));
     for (const id of ["scout", "grunt"]) seat(id, (a) => { a.mode = "subagent"; a.model = sideRef; });
 
     // The critic knob is resolved in resolveFusion (critic "local" follows
     // a non-llama.cpp sidekick).
-    const criticRef = refOf(criticPatch.model, criticPatch.variant);
+    const criticRef = reroute(refOf(criticPatch.model, criticPatch.variant));
     seat("critic", (a) => { a.mode = "subagent"; a.model = criticRef; });
 
     // Per-agent local reasoning effort, the declarative copy. llama.cpp
@@ -1583,6 +1980,7 @@ const setupV2 = async (ctx) => {
   // model id regardless. This transform still helps registries built from
   // sources without a declared wire id or context size.
   await ctx.model.transform((editor) => {
+    const { localWireId, localRuntime, unit } = S();
     for (const m of editor.list("llamacpp")) {
       if (localWireId) m.modelID = localWireId;
     }
@@ -1685,7 +2083,7 @@ const setupV2 = async (ctx) => {
       },
       options: { codemode: false },
       execute: (args, tctx) =>
-        escalateImpl(args, {
+        S().escalateImpl(args, {
           agent: tctx.agent,
           sessionID: tctx.sessionID,
           directory,
@@ -1715,7 +2113,7 @@ const setupV2 = async (ctx) => {
       },
       options: { codemode: false },
       execute: (args, tctx) =>
-        workOrderImpl(args, {
+        S().workOrderImpl(args, {
           agent: tctx.agent,
           sessionID: tctx.sessionID,
           directory,
@@ -1779,11 +2177,15 @@ const setupV2 = async (ctx) => {
   // "local" placeholder that the http.request hook rewrites to the
   // resident id, and only a genuinely non-resident name is a violation.
   registrations.push(await ctx.session.hook("model.request", async (event) => {
+    const { profile, llamaBase, unit, readResidentLive, cfgWireIds } = S();
     if (profile.guard === "off") return;
-    const baseURL = event.baseURL ?? `http://127.0.0.1:${unit.port ?? 8080}`;
+    const baseURL = event.baseURL ?? llamaBase ?? `http://127.0.0.1:${unit.port ?? 8080}`;
     const ids = await readResidentLive(baseURL, event.headers);
     const residentList = ids && ids.size ? [...ids].join(", ") : "none";
     if (!ids || !ids.size) {
+      // Unreachable is also the backend-down signal: mark it so sidekick
+      // seats reroute and the TUI hears about it once.
+      if (!ids) markBackend("llamacpp", true, "unreachable or unauthorized");
       throw new Error(
         `[fusion] no resident model readable at ${baseURL}/v1/models ` +
         `(server ${ids ? "has nothing loaded" : "unreachable or unauthorized"}). ` +
@@ -1813,6 +2215,59 @@ const setupV2 = async (ctx) => {
     console.error(`${msg} Allowing because guard is "warn"; the wire rewrite sends the resident id instead.`);
   }, { providerID: "llamacpp" }));
 
+  // Slot gate (see slot-gate.mjs). The wait happens here, in model.request,
+  // because this hook runs before opencode builds the request and starts
+  // its timeout: a request that waits its turn cannot time out while it
+  // waits. A backend with more than one slot is not gated.
+  const slotCounts = { strata: null };
+  const slotsOf = async (providerID) => {
+    if (providerID === "llamacpp") return S().localRuntime?.parallel ?? S().unit.parallel ?? 1;
+    if (slotCounts.strata == null) {
+      try {
+        const res = await fetch(`${S().strataBase}/slots`, {
+          headers: { authorization: `Bearer ${readKeyFile(STRATA_KEY_FILE)}` },
+          signal: AbortSignal.timeout(2500),
+        });
+        const d = res.ok ? await res.json() : null;
+        const list = Array.isArray(d) ? d : d?.slots;
+        if (Array.isArray(list) && list.length) slotCounts.strata = list.length;
+      } catch { /* unknown: treat as one slot below, and probe again next time */ }
+    }
+    return slotCounts.strata ?? 1;
+  };
+  const backendName = (providerID) => (providerID === "strata" ? "Strata" : "llama-server");
+  const slotAgent = new Map(); // sessionID -> agent of its last step, for notices
+  const slotGate = makeSlotGate({
+    maxWaitMs: () => (Number(S().profile.slot_wait_minutes) || 60) * 60_000,
+    onWait: ({ backend, sid, owner }) => {
+      logControl({ kind: "slot-wait", backend, session: sid, owner });
+      emitNotice(
+        "slot-wait",
+        `${backendName(backend)} has one slot and the ${slotAgent.get(owner) ?? "other"} session ${owner.slice(-8)} is using it. This request waits its turn, so neither session loses its prompt cache.`,
+        "It starts when that session finishes its run. Set \"slot_gate\": false in fusion.jsonc to turn this off.",
+        { severity: "info", sessionID: sid },
+      );
+    },
+    onGrant: ({ backend, sid, reason, waitedMs }) => {
+      logControl({ kind: "slot-grant", backend, session: sid, reason, waited_s: Math.round(waitedMs / 1000) });
+      if (reason === "timeout" || reason === "stale") {
+        emitNotice(
+          "slot-timeout",
+          `${backendName(backend)}: session ${sid.slice(-8)} stopped waiting (${reason === "timeout" ? "slot_wait_minutes reached" : "the owner shows no activity"}) and now shares the slot.`,
+          "Both sessions now remove each other's prompt cache. Let one finish first if requests get slow.",
+          { sessionID: sid },
+        );
+      }
+    },
+  });
+  for (const providerID of LOCAL_PROVIDERS) {
+    registrations.push(await ctx.session.hook("model.request", async (event) => {
+      if (S().profile.slot_gate === false || !event.sessionID) return;
+      if ((await slotsOf(providerID)) > 1) return;
+      await slotGate.acquire(providerID, event.sessionID);
+    }, { providerID }));
+  }
+
   // The wire stamp. Aliases declare modelID "local" and plugin transforms
   // cannot beat the post-phase config builtin, so the resolved wire id is
   // rewritten at the last point of control: the serialized request body.
@@ -1820,6 +2275,7 @@ const setupV2 = async (ctx) => {
   // hook is scoped to llamacpp by the provider filter and self-guards by
   // URL so a mis-scoped request can never pick up a local wire id.
   registrations.push(await ctx.session.hook("http.request", async (event) => {
+    const { profile, unit, readResidentLive, pickWireId, cfgWireIds, effortFor } = S();
     const req = event.request;
     if (!req?.body) return;
     // Only requests that target the llama-server port are rewritten. When
@@ -1865,9 +2321,61 @@ const setupV2 = async (ctx) => {
       return; // not JSON: not a chat request, leave it alone
     }
     if (!json || typeof json !== "object" || Array.isArray(json)) return;
-    if (!stampEffort(json, effortFor(event.agent, "strata"))) return;
+    if (!stampEffort(json, S().effortFor(event.agent, "strata"))) return;
     event.request = rebuildRequest(req, json);
   }, { providerID: "strata" }));
+
+  // Local backend error visibility. A 400 the TUI would only ever show as
+  // "step failed" gets decoded once: context overflow gets its own action,
+  // everything else is reported as a backend error. The hook is the
+  // fire-and-forget observer kind (it must return nothing), so the notice
+  // lands through emitNotice, not by throwing.
+  for (const providerID of LOCAL_PROVIDERS) {
+    registrations.push(await ctx.session.hook("http.response", async (event) => {
+      const res = event.response;
+      if (!res || res.status < 400) return;
+      const name = providerID === "strata" ? "Strata" : "llama-server";
+      const body = await res.clone().text().catch(() => "");
+      const blob = `${res.status} ${body}`.slice(0, 400);
+      if (res.status === 400 && /context|tokens?|too (long|large)|exceed|maximum/i.test(blob)) {
+        emitNotice(
+          "context-400",
+          `${name} refused the request: the prompt plus the reply budget did not fit the context.`,
+          "Compact the session, shorten the last request, or lower the model's output limit.",
+          { sessionID: event.sessionID },
+        );
+      } else {
+        emitNotice(
+          "backend-error",
+          `${name} answered HTTP ${res.status}: ${body.trim().slice(0, 140) || "no details"}.`,
+          providerID === "strata"
+            ? "Check the Strata server, or switch the sidekick with /fusion sidekick."
+            : "Check llama-server, or switch the sidekick with /fusion sidekick.",
+          { severity: "error", sessionID: event.sessionID },
+        );
+      }
+    }, { providerID }));
+  }
+
+  // v1 compaction.prune parity: shrink stale tool outputs in the assembled
+  // context before they reach the model. Only active when the config still
+  // declares the v1 flag; on v2 it is what makes the key true rather than
+  // dead. Error results and the newest protectTail characters stay whole.
+  if (configAudit.pruneEnabled) {
+    registrations.push(await ctx.session.hook("context", (event) => {
+      const n = pruneOldToolOutputs(event.messages);
+      if (n) logControl({ kind: "prune", session: event.sessionID, results: n });
+    }));
+  }
+
+  // A down local backend makes every retry burn time for nothing. Refuse
+  // retries aimed at it; the seat already rerouted or the error says why.
+  registrations.push(await ctx.session.hook("retry", (event) => {
+    const providerID = event.model?.providerID;
+    if (providerID && backendDown[providerID]) {
+      event.decision = { retry: false };
+    }
+  }));
 
   // The sampler strip covers every local request kind. (chat.params fired
   // for all of them in v1; v2 splits request construction per kind.)
@@ -1885,6 +2393,7 @@ const setupV2 = async (ctx) => {
   // carries the counters, not a memory of them. Runs for every provider:
   // the controller tracks harness state, not llamacpp state.
   registrations.push(await ctx.session.hook("compaction", (event) => {
+    const { profile } = S();
     if (LOCAL_PROVIDERS.includes(event.model?.providerID)) stripSampler(event.options);
     event.system.push({
       type: "text",
@@ -1938,8 +2447,10 @@ const setupV2 = async (ctx) => {
   // fusion_blocked (it never runs and the agent gets the reason as output);
   // observe queues a notice that the after-hook appends. Either way logged.
   const gateV2 = (event, kind, reason, extra = {}) => {
+    const { profile } = S();
     logControl({ kind: profile.routing === "enforce" ? `${kind}-blocked` : `${kind}-observed`, ...extra, reason });
     if (profile.routing === "enforce") {
+      recordBlocked(ctrl, event.tool, kind, reason);
       event.input = { reason, tool: event.tool, args: event.input };
       event.tool = "fusion_blocked";
       return;
@@ -1951,12 +2462,26 @@ const setupV2 = async (ctx) => {
   // auto-scanned plugin directory, so recorded commands are what the model
   // asked for, not the compressed equivalent.
   registrations.push(await ctx.tool.hook("execute.before", async (event) => {
+    const { profile } = S();
     const agent = String(event.agent ?? "fusion");
     const args = event.input && typeof event.input === "object" ? event.input : {};
 
     if (event.tool === "subagent" || event.tool === "task") {
       const to = args.agent ?? args.subagent_type ?? "?";
       logControl({ kind: "dispatch", session: event.sessionID, agent, to, desc: String(args.description ?? "").slice(0, 120) });
+      // One GPU: a second local subagent is refused in every routing mode,
+      // not only enforce. Two at once split the single slot and the GPU.
+      const { sidekickIsLocal, criticPatch } = S();
+      const local = isLocalSubagent(to, { sidekickIsLocal, criticModel: criticPatch.model, localProviders: LOCAL_PROVIDERS });
+      const busy = gateSubagent(ctrl, to, local);
+      if (busy) {
+        logControl({ kind: "one-gpu-blocked", to, reason: busy });
+        recordBlocked(ctrl, event.tool, "one-gpu", busy);
+        event.input = { reason: busy, tool: event.tool, args: event.input };
+        event.tool = "fusion_blocked";
+        return;
+      }
+      if (local) startSubagent(ctrl, event.id, to);
       // The oracle is parked unless escalation is explicitly "fable". The
       // registry cannot remove it (config re-adds it after this plugin's
       // transform), so the gate is what actually keeps paid calls opt-in.
@@ -2020,7 +2545,9 @@ const setupV2 = async (ctx) => {
         : "";
 
   registrations.push(await ctx.tool.hook("execute.after", async (event) => {
+    const { profile, localSummarize } = S();
     const toolName = event.tool;
+    if (toolName === "subagent" || toolName === "task") endSubagent(ctrl, event.id);
 
     // A gated call: drain its pending entry without counting (it never ran),
     // and never feed the refusal text into compression. The after event's
@@ -2157,6 +2684,221 @@ const setupV2 = async (ctx) => {
     }
   }));
 
+  // -------------------------------------------------------- the /fusion RPC
+  //
+  // The TUI plugin (plugins/fusion/tui.tsx) renders the control surface and
+  // this is its read/write channel. status composes the panel, live backend
+  // health, accounting and the config audit. set writes one knob back to the
+  // profile file and applies it live; choices feeds the pickers.
+  const buildStatus = async (sessionID) => {
+    const f = S();
+    const { profile } = f;
+    for (const p of LOCAL_PROVIDERS) {
+      if (localSeatsUse(p)) await checkBackend(p);
+    }
+    let strataLive = null;
+    if (f.sidekickIsStrata || f.providerOf(f.criticPatch.model) === "strata") {
+      try {
+        const res = await fetch(`${f.strataBase}/health`, { signal: AbortSignal.timeout(2000) });
+        if (res.ok) {
+          const h = await res.json();
+          strataLive = { model: h.model ?? null, maxContext: h.max_context ?? null, loaded: h.loaded ?? null };
+        }
+      } catch {
+        /* unreachable: health[p] already says so */
+      }
+    }
+    const usageFile = path.join(fusionDir, "usage.jsonl");
+    const session = usageTotals(readUsageRows(usageFile, sessionID || undefined), profile.base);
+    const totals = usageTotals(readUsageRows(usageFile), profile.base);
+    const rtkInstalled = (() => {
+      try {
+        return spawnSync("rtk", ["--version"], { stdio: "ignore" }).status === 0;
+      } catch {
+        return false;
+      }
+    })();
+    const activeFallback =
+      profile.sidekick_fallback && LOCAL_PROVIDERS.some((p) => backendDown[p] && localSeatsUse(p))
+        ? SIDEKICKS[profile.sidekick_fallback] ?? null
+        : null;
+    return {
+      banner: f.banner,
+      profile: {
+        base: profile.base,
+        sidekick: profile.sidekick,
+        critic: profile.critic,
+        reasoning: profile.reasoning,
+        speed: profile.speed,
+        escalation: profile.escalation,
+        guard: profile.guard,
+        routing: profile.routing,
+        sidekick_fallback: profile.sidekick_fallback ?? null,
+        local_efforts: profile.local_efforts ?? {},
+        local_model: profile.local_model ?? null,
+        local_ctx: profile.local_ctx ?? null,
+      },
+      resolved: {
+        lead: `${f.leadModel}${f.leadEffort ? ` (${f.leadEffort})` : ""}`,
+        sidekick: f.sidekick,
+        critic: `${f.criticPatch.model}${f.criticPatch.variant ? ` (${f.criticPatch.variant})` : ""}`,
+        oracle: profile.escalation === "fable" ? `${f.oracleBase.model} (${f.oracleEffort})` : "parked",
+      },
+      backend: {
+        llamacpp: {
+          url: f.llamaBase ?? (f.unit.port ? `http://127.0.0.1:${f.unit.port}` : null),
+          remote: f.remote,
+          down: backendDown.llamacpp,
+          up: health.llamacpp.ok === true,
+          used: localSeatsUse("llamacpp"),
+          resident: f.localWireId ? [f.localWireId] : [],
+          ctx: f.unit.ctx ?? null,
+          parallel: f.unit.parallel ?? null,
+        },
+        strata: {
+          url: f.strataBase,
+          down: backendDown.strata,
+          up: health.strata.ok === true,
+          used: localSeatsUse("strata"),
+          live: strataLive,
+        },
+        fallback: { name: profile.sidekick_fallback ?? null, active: activeFallback },
+      },
+      graft: { present: f.hasGraft() },
+      rtk: { installed: rtkInstalled },
+      stalls: f.stallsSummary(),
+      session: sessionID
+        ? { id: sessionID, cost: session.totalCost, shadowCost: session.shadowCost, freeLead: session.freeLead, agents: session.byAgent }
+        : null,
+      totals: { cost: totals.totalCost, shadowCost: totals.shadowCost, freeLead: totals.freeLead },
+      dropped: { audited: configAudit.audited, unaudited: configAudit.unaudited },
+      pruneActive: configAudit.pruneEnabled,
+    };
+  };
+
+  const runDoctor = () =>
+    new Promise((resolve) => {
+      let child;
+      try {
+        child = spawn("bash", [graftBin, "doctor"], { cwd: directory, stdio: ["ignore", "pipe", "pipe"] });
+      } catch (e) {
+        return resolve(`oc-fusion doctor could not start: ${e.message}`);
+      }
+      let out = "";
+      const timer = setTimeout(() => {
+        child.kill("SIGTERM");
+        resolve(`${out}\n[doctor timed out after 45s]`);
+      }, 45_000);
+      child.stdout.on("data", (d) => {
+        out += d;
+      });
+      child.stderr.on("data", (d) => {
+        out += d;
+      });
+      child.on("error", (e) => {
+        clearTimeout(timer);
+        resolve(`oc-fusion doctor could not start: ${e.message}`);
+      });
+      child.on("close", () => {
+        clearTimeout(timer);
+        resolve(out.trim() || "doctor produced no output");
+      });
+    });
+
+  try {
+    const rpcReg = await ctx.rpc.register(FUSION_RPC, {
+      status: async ({ sessionID } = {}) => buildStatus(sessionID),
+      choices: async ({ key } = {}) => {
+        const { profile } = S();
+        if (key === "effort") {
+          const current = profile.local_efforts ?? {};
+          return {
+            key,
+            label: "Local effort per seat",
+            help: "reasoning_effort sent to llama.cpp or Strata per agent. Must be a level the model's chat template accepts.",
+            seats: EFFORT_SEATS.map((seat) => ({
+              seat,
+              current: current[seat] ?? "medium",
+              options: EFFORT_LEVELS.map((v) => ({ value: v, title: v })),
+            })),
+          };
+        }
+        const knob = KNOBS[key];
+        if (!knob) {
+          return {
+            key,
+            error: `"/fusion ${key}" is not a control. Valid: ${["status", "effort", "doctor", "help", ...Object.keys(KNOBS)].join(", ")}.`,
+          };
+        }
+        return {
+          key,
+          label: knob.label,
+          help: knob.help,
+          current: profile[knob.write],
+          options: knob.options(BASES, SIDEKICKS),
+        };
+      },
+      set: async ({ key, value } = {}, callCtx) => {
+        const file = S().profileFile;
+        if (!file) {
+          return callCtx.error("no-profile", "No fusion.jsonc is in effect (defaults only). Create one first, then retry.");
+        }
+        if (String(key).startsWith("local_efforts.")) {
+          const seat = String(key).split(".")[1];
+          if (!EFFORT_SEATS.includes(seat)) {
+            return callCtx.error("bad-key", `Unknown effort seat "${seat}". Seats: ${EFFORT_SEATS.join(", ")}.`);
+          }
+          if (!EFFORT_LEVELS.includes(value)) {
+            return callCtx.error("bad-value", `"${value}" is not a level. Levels: ${EFFORT_LEVELS.join(", ")}.`);
+          }
+          if (!writePanelEffort(file, seat, value)) {
+            return callCtx.error("write-failed", `Could not write "${seat}" into "local_efforts" in ${file}.`);
+          }
+          await refresh();
+          void ctx.agent.reload?.().catch?.(() => {});
+          emitNotice("profile-set", `${seat} effort is now "${value}".`, "It applies to the next local request.", {
+            severity: "info",
+          });
+          return { applied: true, key, value, file };
+        }
+        const knob = KNOBS[String(key)];
+        if (!knob) {
+          return callCtx.error("bad-key", `"${key}" is not a control. Valid: ${Object.keys(KNOBS).join(", ")}.`);
+        }
+        const valid = knob.options(BASES, SIDEKICKS).map((o) => o.value);
+        if (!valid.includes(value)) {
+          return callCtx.error("bad-value", `"${value}" is not a valid ${knob.label.toLowerCase()}. Valid: ${valid.join(", ")}.`);
+        }
+        if (!writePanelKey(file, knob.write, value)) {
+          return callCtx.error(
+            "write-failed",
+            `Could not write "${knob.write}" into ${file}: the key is missing. Add it once, then /fusion can set it.`,
+          );
+        }
+        await refresh();
+        void ctx.agent.reload?.().catch?.(() => {});
+        void ctx.model.reload?.().catch?.(() => {});
+        const note =
+          key === "sidekick" && /^strata/.test(String(value))
+            ? "The remote Strata model swap only runs through `oc-fusion sidekick` on the box."
+            : null;
+        emitNotice("profile-set", `${knob.label} is now "${value}".`, note ?? "It applies to the next request.", {
+          severity: "info",
+        });
+        return { applied: true, key, value, file, note };
+      },
+      doctor: async () => ({ text: await runDoctor() }),
+      notices: async () => {
+        drainPendingFile();
+        return { items: notices.list() };
+      },
+    });
+    rpcEvents = rpcReg.events;
+    registrations.push(rpcReg);
+  } catch (e) {
+    console.error(`[fusion] RPC registration failed (${e.message}); /fusion controls are unavailable on this host`);
+  }
+
   // ------------------------------------------------- usage accounting
   //
   // v2 step events carry what v1 reconstructed: session.step.started has
@@ -2169,6 +2911,14 @@ const setupV2 = async (ctx) => {
   const usageLoop = (async () => {
     try {
       for await (const event of ctx.event.subscribe({ signal: usageCtl.signal })) {
+        // Slot gate feed: the session tree and when each run starts and ends.
+        if (event.sessionID) {
+          if (event.type === "session.created") slotGate.created(event.sessionID, event.parentID);
+          else if (event.type === "session.execution.started") slotGate.started(event.sessionID);
+          else if (/^session\.execution\.(succeeded|failed|interrupted)$/.test(event.type)) slotGate.ended(event.sessionID);
+          else slotGate.activity(event.sessionID);
+          if (event.type === "session.step.started" && event.agent) slotAgent.set(event.sessionID, String(event.agent));
+        }
         if (event.type === "session.step.started") {
           stepMeta.set(event.assistantMessageID, {
             session: event.sessionID,
@@ -2191,6 +2941,37 @@ const setupV2 = async (ctx) => {
           const key = `${event.assistantMessageID}:${event.finish ?? "err"}:${t.input}:${t.output}:${event.cost}`;
           if (seenSteps.has(key)) continue;
           seenSteps.add(key);
+          // Failure notices the TUI would otherwise never decode. Dedup is
+          // inside emitNotice; each kind fires once per distinct message.
+          const prov = meta.model?.providerID;
+          if (event.type === "session.step.ended" && LOCAL_PROVIDERS.includes(prov)
+              && event.finish === "length" && (t.reasoning ?? 0) > 0) {
+            emitNotice(
+              "thinking-truncated",
+              `${prov === "strata" ? "Strata" : "The local model"} spent its whole reply budget on thinking and stopped without an answer.`,
+              "Send the last request again, or lower the seat's effort in /fusion effort.",
+              { sessionID: meta.session ?? event.sessionID },
+            );
+          }
+          if (event.type === "session.step.ended") {
+            const hint = longContextHint(S().profile.long_context, meta.model, t);
+            if (hint) emitNotice("long-context", `${hint.message} (session ${String(meta.session ?? event.sessionID).slice(-8)})`,
+              hint.action, { sessionID: meta.session ?? event.sessionID, severity: "info" });
+          }
+          if (event.type === "session.step.failed" && LOCAL_PROVIDERS.includes(prov)) {
+            const err = event.error ?? {};
+            const blob = `${err.message ?? ""} ${err.response?.body ?? ""}`;
+            if (err.status === 400 && /context|tokens?|too (long|large)|exceed|maximum/i.test(blob)) {
+              emitNotice(
+                "context-400",
+                `${prov === "strata" ? "Strata" : "The local model"} refused the request: the prompt plus the reply budget did not fit the context.`,
+                "Compact the session, shorten the last request, or lower the model's output limit.",
+                { sessionID: meta.session ?? event.sessionID },
+              );
+            } else if (!err.status && /fetch|econn|enotfound|etimedout|socket|network|unreachable|connect|refused/i.test(blob)) {
+              markBackend(prov, true, String(err.message ?? "connection failed").slice(0, 120));
+            }
+          }
           if (seenSteps.size > 4000) {
             const it = seenSteps.values();
             for (let i = 0; i < 2000; i++) {
@@ -2237,8 +3018,10 @@ const setupV2 = async (ctx) => {
   })();
   void usageLoop;
 
-  // Plugin unload cleanup: close the event stream and drop registrations.
+  // Plugin unload cleanup: close the event stream, the health probe timer
+  // and drop registrations.
   return () => {
+    clearInterval(healthTimer);
     usageCtl.abort();
     for (const r of registrations) void r?.dispose?.();
   };

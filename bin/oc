@@ -9,10 +9,53 @@
 # control panel is the harness's own fusion.jsonc unless the project you are
 # in has one of its own, or FUSION_PROFILE names a third.
 set -euo pipefail
-HARNESS="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# Follow a link to the real script before locating the harness. `oc` is often
+# put on PATH as a symlink, and a link makes ${BASH_SOURCE[0]} name the link,
+# not the harness: the config path then points outside the harness and
+# opencode starts with no fusion at all. readlink -f is not on macOS, so walk
+# the links by hand.
+src="${BASH_SOURCE[0]}"
+while [ -L "$src" ]; do
+  dir="$(cd -P "$(dirname "$src")" && pwd)"
+  src="$(readlink "$src")"
+  case "$src" in
+    /*) ;;
+    *) src="$dir/$src" ;;
+  esac
+done
+HARNESS="$(cd -P "$(dirname "$src")/.." && pwd)"
+if [ ! -f "$HARNESS/opencode.jsonc" ]; then
+  echo "oc: loaded from $src, but no harness config at $HARNESS/opencode.jsonc" >&2
+  echo "oc: run the script in its own checkout, or link straight to that file." >&2
+  exit 1
+fi
 export OPENCODE_CONFIG="$HARNESS/opencode.jsonc"
 # Belt and braces: the harness bin on PATH, so the mcp.graft command
 # ["oc-fusion", "graft", "mcp"] resolves even if the plugin's rewrite to an
 # absolute path never runs (plugin disabled, plugin error, hand-edited config).
 export PATH="$HARNESS/bin:$PATH"
+
+# opencode v2 attaches every window to one background server, which keeps
+# the config and plugins it started with. oc-server restarts that server
+# when it is stale and idle, asks for a private server when it is stale and
+# busy, and warns when fusion or rtk did not load. OC_NO_SERVER_CHECK=1 skips
+# it. Only the TUI and `run` use the background server.
+mode=""
+case "${1-}" in
+  ""|-*) mode=tui ;;
+  run) mode=run ;;
+  *) [ -d "$1" ] && mode=tui ;;
+esac
+if [ -n "$mode" ] && [ -z "${OC_NO_SERVER_CHECK-}" ] && command -v python3 >/dev/null; then
+  dir=$PWD
+  [ "$mode" = tui ] && [ -n "${1-}" ] && [ -d "$1" ] && dir=$(cd "$1" && pwd)
+  if [ "$(python3 "$HARNESS/bin/oc-server" ensure "$dir" || true)" = standalone ]; then
+    if [ "$mode" = run ]; then
+      shift
+      exec opencode run --standalone "$@"
+    fi
+    exec opencode --standalone "$@"
+  fi
+fi
 exec opencode "$@"

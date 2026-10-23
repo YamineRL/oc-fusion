@@ -15,7 +15,12 @@ import {
   validateWorkOrder,
   renderResultEnvelope,
   renderControllerState,
-} from "../.opencode/plugin/controller-lib.mjs";
+  recordBlocked,
+  isLocalSubagent,
+  gateSubagent,
+  startSubagent,
+  endSubagent,
+} from "../plugins/fusion/controller-lib.mjs";
 
 test("normalizeCommand collapses whitespace", () => {
   assert.equal(normalizeCommand("  npm   test \n --watch  "), "npm test --watch");
@@ -173,4 +178,32 @@ test("controller state renders compactly for compaction injection", () => {
   txt = renderControllerState(s, limits);
   assert.match(txt, /BLOCKED/);
   assert.match(txt, /lead owns it/);
+});
+
+test("controller state says plainly whether any tool call was refused", () => {
+  // 2026-10-17: after a compaction the lead claimed "subagent dispatch was
+  // blocked twice" when no call had been refused at all, and did 3,418
+  // translations itself. The state block must name refusals, including none.
+  const s = makeControllerState();
+  const limits = { stallEdits: 3, stallCommands: 3, scopeLimit: 8 };
+  assert.match(renderControllerState(s, limits), /refused tool calls: none/);
+  recordBlocked(s, "subagent", "oracle-parked", "the oracle agent is parked");
+  const txt = renderControllerState(s, limits);
+  assert.doesNotMatch(txt, /refused tool calls: none/);
+  assert.match(txt, /subagent.*oracle-parked.*the oracle agent is parked/);
+});
+
+test("one GPU: a second local subagent is refused until the first returns", () => {
+  const st = makeControllerState();
+  const opts = { sidekickIsLocal: true, criticModel: "strata/strata-iq3", localProviders: ["strata", "llamacpp"] };
+  assert.equal(gateSubagent(st, "scout", isLocalSubagent("scout", opts), 0), null);
+  startSubagent(st, "call-1", "scout", 0);
+  assert.match(gateSubagent(st, "grunt", isLocalSubagent("grunt", opts), 1000), /still running/);
+  // The paid oracle does not use the GPU, so it may run beside a local one.
+  assert.equal(gateSubagent(st, "oracle", isLocalSubagent("oracle", opts), 1000), null);
+  endSubagent(st, "call-1");
+  assert.equal(gateSubagent(st, "grunt", isLocalSubagent("grunt", opts), 2000), null);
+  // An entry whose after-hook never fired expires instead of blocking for ever.
+  startSubagent(st, "lost", "critic", 0);
+  assert.equal(gateSubagent(st, "scout", true, 4 * 3600_000), null);
 });

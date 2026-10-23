@@ -42,7 +42,8 @@ s = pat.sub(lambda m: f"{m.group(1)}{new}{m.group(2)}{m.group(3)}", s, count=1)
 open(path, "w").write(s)
 PY
   echo "oc-fusion: $key = $val"
-  echo "oc-fusion: restart opencode to apply."
+  echo "oc-fusion: quit opencode, then start \`oc\` again to apply. (\`oc\` restarts the"
+  echo "           background server once no session runs on it; closing a window alone does not.)"
 }
 
 get_key() {
@@ -55,12 +56,183 @@ print(m.group(1).strip('"') if m else "?")
 PY
 }
 
-# Passive: reads the child server's cmdline. Never touches an inference endpoint.
-resident() {
-  ps -eo args= 2>/dev/null | awk '/llama-server/ && /--alias/ {
-    for (i=1;i<=NF;i++) if ($i=="--alias") { print $(i+1); exit }
-  }'
+# Key files hold one key per line; # lines are comments. Use the first key,
+# the same rule as the plugin's readKeyFile.
+first_key() {
+  [ -f "$1" ] || return 0
+  sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' "$1" | grep -v -e '^#' -e '^$' | head -n 1
 }
+
+# Is anything listening on a local TCP port? No tool is on every host: this
+# box has no lsof (found 2026-10-15) and macOS has no ss, so ask ss, then
+# lsof, then fuser. All checks are read-only and cannot start anything.
+port_listening() {
+  local p="${1-}"
+  [ -n "$p" ] || return 1
+  if command -v ss >/dev/null 2>&1; then
+    ss -H -tln 2>/dev/null | awk '{print $4}' | grep -qE "[:.]$p\$"
+    return
+  fi
+  if command -v lsof >/dev/null 2>&1; then
+    lsof -iTCP:"$p" -sTCP:LISTEN >/dev/null 2>&1
+    return
+  fi
+  command -v fuser >/dev/null 2>&1 && fuser -n tcp "$p" >/dev/null 2>&1
+}
+
+# Passive residency read. With a systemd unit the child server's cmdline is
+# the source, unless the caller names an endpoint: a live HTTP endpoint is
+# then the source, which is what the box needs now that llama-swap owns the
+# llama.cpp process. Without a unit the server is remote and GET /v1/models on
+# its configured baseURL answers instead. Both only read; neither can trigger
+# a model load.
+resident() {
+  local want="${1-}"
+  if [ -f "$UNIT" ] && [ -z "$want" ]; then
+    ps -eo args= 2>/dev/null | awk '/llama-server/ && /--alias/ {
+      for (i=1;i<=NF;i++) if ($i=="--alias") { print $(i+1); exit }
+    }'
+    return
+  fi
+  local kf="${FUSION_API_KEY_FILE:-$HOME/.config/llama-server/api-key}"
+  local base_url
+  base_url="${want:-$(provider_json llamacpp base)}"
+  [ -n "$base_url" ] || return 0
+  [ -f "$kf" ] || return 0
+  curl -sS -m 4 -H "Authorization: Bearer $(first_key "$kf")" "${base_url%/}/models" 2>/dev/null \
+    | python3 -c 'import json,sys
+try:
+    ok = {"loaded", "loading", "ready", "sleeping"}
+    print(" ".join(m["id"] for m in json.load(sys.stdin).get("data", [])
+          if m.get("id") and ((m.get("status") or {}).get("value") or "loaded").lower() in ok))
+except Exception: pass' 2>/dev/null
+}
+
+# Per-model -c from the llama-swap config, both the key style
+# "Model-Id": { cmd: ... -c N } and the list style serve:
+# { models: [ { name: Model-Id, cmd: ... } ] }. Prints "id<TAB>ctx" lines.
+swap_config_ctx() {
+  local cfg="${LLAMA_SWAP_CONFIG:-$HOME/Documents/dev/active/stack/llama-swap/config.yaml}"
+  [ -f "$cfg" ] || return 0
+  python3 - "$cfg" <<'PY' 2>/dev/null
+import re, sys
+s = open(sys.argv[1], encoding="utf-8", errors="replace").read()
+# Each model entry starts at a key that holds a dict with either "cmd" or
+# "command", or a list item with name/cmd. Split on top-level model keys and
+# on "- name:" list items, then take the nearest preceding/next id.
+blocks = []
+for m in re.finditer(r'^  (?:"([^"]+)"|([\w.:/-]+))\s*:\s*$', s, re.M):
+    start = m.start()
+    nxt = re.search(r'^  (?:"[^"]+"|[\w.:/-]+)\s*:\s*$', s[m.end():], re.M)
+    end = m.end() + (nxt.start() if nxt else len(s) - m.end())
+    blocks.append((m.group(1) or m.group(2), s[start:end], start))
+for m in re.finditer(r'^\s*-\s+name:\s*"?([^"\n]+)"?\s*$', s, re.M):
+    start = m.start()
+    nxt = re.search(r'^\s*-\s+name:\s*"?[^"\n]+"?\s*$', s[m.end():], re.M)
+    end = m.end() + (nxt.start() if nxt else len(s) - m.end())
+    blocks.append((m.group(1).strip(), s[start:end], start))
+seen = set()
+for name, body, _ in sorted(blocks, key=lambda b: b[2]):
+    if name in seen:
+        continue
+    # -c lives inside the cmd block; --parallel in the same block.
+    # Comments are not flags: a comment under one entry named another entry's
+    # "-c 45056" and Strata (no -c) inherited it (2026-10-23).
+    body = re.sub(r'(?m)^\s*#.*$', '', body)
+    cm = re.search(r'(?<![\w-])-c\s+(\d+)', body)
+    if not cm:
+        continue
+    seen.add(name)
+    print(f"{name}\t{cm.group(1)}")
+PY
+}
+
+# Compare every llama-swap unit's -c against the limit.context declared for it
+# in the GLOBAL provider config (opencode merges that with the harness config,
+# and it is where a non-fusion alias like sage-q5 lives). Two failure shapes:
+# context >= server ctx (server rejects a packed prompt) and limit.input far
+# under ctx (compaction throws away window: 65536 against 163840 compacted at
+# 40K on 2026-10-22). Prints its own report; empty when there is nothing to
+# compare (no swap config, or no global config).
+limits_check() {
+  local cfg="${LLAMA_SWAP_CONFIG:-$HOME/Documents/dev/active/stack/llama-swap/config.yaml}"
+  local global="${OPENCODE_GLOBAL_CONFIG:-$HOME/.config/opencode/opencode.json}"
+  [ -f "$cfg" ] || { echo "limits    skipped: no llama-swap config (set LLAMA_SWAP_CONFIG)"; return 0; }
+  local pairs
+  pairs=$(swap_config_ctx)
+  [ -n "$pairs" ] || return 0
+  # Pairs go in a temp file, not stdin: stdin is the python program.
+  tmp=$(mktemp "${TMPDIR:-/tmp}/oc-fusion-limits.XXXXXX")
+  printf '%s\n' "$pairs" >"$tmp"
+  python3 - "$global" "$cfg" "$tmp" <<'PY'
+import json, re, sys
+
+global_path, cfg_path, pairs_path = sys.argv[1:4]
+pairs = [line.split("\t") for line in open(pairs_path).read().splitlines() if "\t" in line]
+pairs = [[a, b, ""] for a, b in pairs]
+
+def load_lenient(path):
+    try:
+        return json.load(open(path, encoding="utf-8"))
+    except Exception:
+        s = open(path, encoding="utf-8").read()
+        s = re.sub(r'"(?:[^"\\]|\\.)*"|//[^\n]*',
+                   lambda m: m.group(0) if m.group(0).startswith('"') else "", s)
+        return json.loads(re.sub(r",(\s*[}\]])", r"\1", s))
+
+try:
+    g = load_lenient(global_path)
+except Exception:
+    print(f"limits    skipped: cannot read {global_path}")
+    raise SystemExit
+
+reserved = (g.get("compaction") or {}).get("reserved") or 8000
+models = {}
+for prov in (g.get("provider") or {}).values():
+    for name, m in (prov.get("models") or {}).items():
+        if m.get("id"):
+            models[m["id"]] = (name, m.get("limit") or {})
+
+print(f"limits    per model (server {cfg_path}, limits {global_path})")
+bad = []
+for pair in pairs:
+    mid, ctx = pair[0], pair[1]
+    if not ctx.isdigit():
+        continue
+    ctx = int(ctx)
+    hit = models.get(mid)
+    if not hit:
+        continue              # alias not declared here; opencode never names it
+    name, lim = hit
+    d_ctx = lim.get("context")
+    d_in = lim.get("input")
+    d_out = lim.get("output")
+    flags = []
+    if isinstance(d_ctx, int) and d_ctx > ctx:
+        flags.append(f"context {d_ctx} > server {ctx}: server rejects the last tokens")
+    # opencode v2 compacts at (input or context) - reserved, and the summary
+    # gets min(output, 32000, context - start) tokens. input + output > ctx is
+    # normal and fine; a summary budget too small to think and write is not
+    # (2026-10-16: 8000 tokens, every long compaction hit the output limit).
+    start = (d_in if isinstance(d_in, int) else (d_ctx or ctx)) - reserved
+    budget = min(d_out if isinstance(d_out, int) else 32000, 32000, (d_ctx or ctx) - start)
+    if budget < 16000:
+        flags.append(f"summary budget {budget} < 16000: long compactions can fail")
+    if isinstance(d_in, int) and d_in < ctx * 3 // 4:
+        flags.append(f"input {d_in} under 75% of {ctx}: compacts early")
+    state = "; ".join(flags) if flags else "ok"
+    if flags:
+        bad.append((mid, ctx, d_ctx, d_in, d_out))
+    print(f"  {mid:<32} ctx={ctx:<7} limit={d_ctx if d_ctx is not None else '?':<7} "
+          f"in={d_in if d_in is not None else '?':<7} out={d_out if d_out is not None else '?':<6} "
+          f"compacts@{start} summary={budget} {state}")
+if bad:
+    print("  not-ok is advice, not truth: check the server ctx yourself before you edit.")
+    print("  Keep limit.context <= server ctx; keep context - (input - reserved) >= 16000.")
+PY
+  rm -f "$tmp"
+}
+
 
 # The Strata model the panel uses ("" when sidekick and critic are not Strata):
 # a strata-* sidekick, else strata-iq3 for critic "strata".
@@ -125,6 +297,10 @@ usage: oc-fusion <command>
   status                 show the current panel and the live local server
   base       <$(echo $BASES | tr ' ' '|')>
   sidekick   <$(echo $SIDEKICKS | tr ' ' '|')>
+                         strata / strata-coder pick the Strata model; when
+                         "strata_remote_swap" names an ssh host in
+                         fusion.jsonc the switch first runs `strata-use`
+                         there (opt-in, off by default)
   critic     <$(echo $CRITICS | tr ' ' '|')>
   speed      <$(echo $SPEEDS | tr ' ' '|')>
   reasoning  <$(echo $EFFORTS | tr ' ' '|')>
@@ -133,10 +309,12 @@ usage: oc-fusion <command>
   guard      <$(echo $GUARDS | tr ' ' '|')>
   compress   <on|off>
   usage                  aggregate .fusion/usage.jsonl (per-agent tokens + cost)
-  doctor                 check the config against Strata and the llama-server unit
+  turns [--hours N]      failed tool calls per agent and the minutes they cost
+  doctor                 check the config against Strata and the llama-server
+                         unit (or its remote endpoint when no unit exists)
   graft      <build|check|map|ask|grep|skeleton|callers|blast|mcp> [args...]
                          local graph in your current project; network-isolated
-                         on Linux (unshare required). See oc-fusion graft help.
+                         (macOS sandbox-exec, Linux unshare). See oc-fusion graft help.
   routing    <observe|enforce>
                          evidence routing: observe logs stalls/scope only,
                          enforce blocks repeated failures and out-of-scope edits
@@ -174,6 +352,20 @@ case "$cmd" in
     echo "resident  ${local_res:-<nothing loaded>} (llama-server)"
     if command -v systemctl >/dev/null; then
       echo "service   llama-server.service: $(systemctl --user is-active llama-server.service 2>/dev/null || echo unknown)"
+    else
+      # No systemd: the llamacpp endpoint is remote or behind a tunnel. A
+      # listener on its local port is the best passive up/down signal.
+      base_url=$(provider_json llamacpp base)
+      port=$(printf '%s' "$base_url" | sed -n 's#.*:\([0-9][0-9]*\)/.*#\1#p')
+      case "$base_url" in
+        *://127.0.0.1:*|*://localhost:*|*://\[::1\]:*)
+          if [ -n "$port" ] && lsof -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then
+            echo "llama     endpoint $base_url: listener up"
+          else
+            echo "llama     endpoint $base_url: nothing listening (start the server or its tunnel)"
+          fi ;;
+        *) echo "llama     endpoint ${base_url:-<none>} (remote host; listener check skipped)" ;;
+      esac
     fi
     ;;
   base|oracle)
@@ -183,6 +375,19 @@ case "$cmd" in
   sidekick)
     [ $# -ge 2 ] || die "usage: oc-fusion sidekick <$(echo $SIDEKICKS | tr ' ' '|')>"
     in_list "$2" $SIDEKICKS || die "unknown sidekick \"$2\". Known: $SIDEKICKS"
+    # Strata serves one model, so switching between strata aliases means the
+    # server must run the matching one. When the panel's strata_remote_swap
+    # names an ssh destination (off by default), ask that host to swap first
+    # and change the profile only if it worked.
+    case "$2" in
+      strata|strata-coder)
+        sw=$(get_key strata_remote_swap)
+        if [ -n "$sw" ] && [ "$sw" != "?" ] && [ "$sw" != "null" ]; then
+          [ "$2" = strata ] && want=iq3 || want=coder
+          ssh -o BatchMode=yes -o ConnectTimeout=5 "$sw" "strata-use $want" \
+            || die "could not switch Strata to $want via $sw (busy or unreachable: run strata-use $want there and retry)"
+        fi ;;
+    esac
     set_key sidekick "$2" yes ;;
   critic)
     [ $# -ge 2 ] || die "usage: oc-fusion critic <$(echo $CRITICS | tr ' ' '|')>"
@@ -298,7 +503,7 @@ PY
     case "$2" in on) v=true;; off) v=false;; *) die "use on or off";; esac
     set_key compress_tool_output "$v" no ;;
   graft)
-    # Forward to the global graft CLI in the CALLER's project (cwd) — never the
+    # Forward to the global graft CLI in the CALLER's project (cwd): never the
     # harness root. Explicit only: this path does not install graft, and it
     # builds or refreshes nothing on its own; a forwarded query may refresh the
     # project's local graft/ cache the way graft itself does.
@@ -308,8 +513,9 @@ PY
 usage: oc-fusion graft <build|check|map|ask|grep|skeleton|callers|blast|mcp> [args...]
 
 Use the globally installed graft CLI (npm install -g @nanonets/graft) in
-this project. Linux unshare isolates the process AND its children from the
-network; telemetry is disabled. Missing isolation fails closed, never online.
+this project. The offline wrapper isolates the process AND its children from
+the network (macOS sandbox-exec, Linux unshare); telemetry is disabled.
+Missing isolation fails closed, never online.
 This is network isolation, not a filesystem sandbox: queries may refresh the
 local graph. Build explicitly once, then restart OpenCode to discover tools.
 --deep is not supported here. Use plain graft outside Fusion if you explicitly
@@ -317,7 +523,7 @@ want provider-backed enrichment. oc-fusion graft --help shows the CLI manual.
 EOF
       exit 0
     fi
-    command -v graft >/dev/null || die "graft CLI not on PATH — npm install -g @nanonets/graft"
+    command -v graft >/dev/null || die "graft CLI not on PATH: npm install -g @nanonets/graft"
     case "$1" in
       -h|--help|help) set -- --help ;;
       *) in_list "$1" $GRAFT_CMDS || die "unknown graft command \"$1\". Known: $GRAFT_CMDS" ;;
@@ -325,10 +531,24 @@ EOF
     for arg in "$@"; do
       case "$arg" in --deep|--deep=*) die "--deep is outside Fusion's offline structural workflow" ;; esac
     done
-    command -v unshare >/dev/null || die "offline Graft requires Linux unshare (util-linux); refusing to run online"
-    unshare --user --map-root-user --net true 2>/dev/null || die "network isolation unavailable; enable unprivileged user namespaces to use offline Graft"
     export DO_NOT_TRACK=1
-    exec unshare --user --map-root-user --net -- graft "$@"
+    case "$(uname -s)" in
+      Darwin)
+        # Inline profile, no temp file. BSD mktemp does not randomize X's
+        # followed by a suffix (".XXXXXX.sb" was a fixed name), and exec skips
+        # the EXIT trap, so the file leaked and every later call failed with
+        # "mkstemp failed: File exists".
+        SB_PROFILE='(version 1)(allow default)(deny network*)'
+        sandbox-exec -p "$SB_PROFILE" true 2>/dev/null || die "network isolation unavailable (sandbox-exec failed); refusing to run online"
+        exec sandbox-exec -p "$SB_PROFILE" graft "$@"
+        ;;
+      Linux)
+        command -v unshare >/dev/null || die "offline Graft requires Linux unshare (util-linux); refusing to run online"
+        unshare --user --map-root-user --net true 2>/dev/null || die "network isolation unavailable; enable unprivileged user namespaces to use offline Graft"
+        exec unshare --user --map-root-user --net -- graft "$@"
+        ;;
+      *) die "unsupported platform for the offline graft wrapper: $(uname -s)" ;;
+    esac
     ;;
   doctor)
     sk=$(get_key sidekick)
@@ -377,13 +597,46 @@ EOF
         fi
       done
       base_url=$(provider_json llamacpp base)
+      # 2026-10-15: llama.cpp has no port of its own since llama-swap took the
+      # process over, so a disabled unit can sit next to a live endpoint.
+      # FUSION_BASE_URL and the config baseURL name where requests actually go;
+      # that endpoint is what must answer, and while it does its model list is
+      # the residency source.
+      endpoint="${FUSION_BASE_URL:-$base_url}"
       echo "baseURL   $base_url"
+      if [ -n "${FUSION_BASE_URL-}" ] && [ "$FUSION_BASE_URL" != "$base_url" ]; then
+        echo "plugin    FUSION_BASE_URL=$FUSION_BASE_URL (plugin probes there, opencode sends to baseURL)"
+      fi
+      ep_port=$(printf '%s' "$endpoint" | sed -n 's#.*:\([0-9][0-9]*\)/.*#\1#p')
+      ep_live=
+      unit_live=
+      port_listening "$ep_port" && ep_live=1
+      port_listening "$port" && unit_live=1
       case "$base_url" in
         *":$port/"*) echo "  ok: baseURL port matches the unit." ;;
-        *) echo "  WARN: baseURL does not use the unit's port ($port)." ;;
+        *)
+          if [ -n "$ep_live" ] && [ -n "$unit_live" ]; then
+            echo "  WARN: both $port (unit) and $ep_port (baseURL) answer; two local endpoints."
+          elif [ -n "$ep_live" ]; then
+            echo "  ok: baseURL answers on $ep_port; unit port $port is the retired standalone server."
+          else
+            echo "  WARN: nothing listens on the baseURL port ${ep_port:-?}; local agents will fail."
+          fi ;;
       esac
-      r=$(resident || true)
-      echo "resident  ${r:-<nothing loaded>}"
+      if [ -n "$ep_live" ]; then
+        r=$(resident "$endpoint" || true)
+        echo "resident  ${r:-<nothing loaded>}${r:+ (from the endpoint; llama-swap may swap)}"
+      else
+        r=$(resident || true)
+        echo "resident  ${r:-<nothing loaded>}"
+      fi
+      # $ROOT/opencode.jsonc declares at most THREE local aliases, all pointing
+      # at whatever is resident. The sizes of the other llama-swap units live
+      # in the server's config and in the GLOBAL provider config (which
+      # opencode merges with this one), so read those two and compare there.
+      # 2026-10-22: Sage Q5 ran -c 163840 while its limit still said 65536.
+      limits_out=$(limits_check)
+      [ -n "$limits_out" ] && printf '%s\n' "$limits_out"
       if [ -n "$r" ]; then
         # The plugin stamps the resident wire id onto the local aliases at
         # load, so any pinned "id" here is a stale pin, not the source of truth.
@@ -396,32 +649,91 @@ EOF
       fi
       [ "$mmax" = "1" ] && echo "note      models-max=1: only one local model can be resident at a time."
       [ "$par" = "1" ] && echo "note      parallel=1: concurrent local calls queue rather than overlap."
-    elif in_list "$sk" local local-fast local-deep; then
-      echo "llama     WARN: no unit at $UNIT but sidekick \"$sk\" runs on llama-server."
     else
-      echo "llama     no unit at $UNIT (not used by this panel; skipped)"
+      # No systemd unit: when this panel uses llamacpp the server lives on
+      # another host and is reached over HTTP (a tunnel, typically). All
+      # reads are passive: /health, /v1/models and /props never name a
+      # model, so they cannot trigger a load.
+      base_url=$(provider_json llamacpp base)
+      if [ -z "$base_url" ]; then
+        echo "llama     no unit at $UNIT and provider.llamacpp has no baseURL (skipped)"
+      else
+        origin=$(printf '%s' "$base_url" | sed 's#/v1/*$##')
+        port=$(printf '%s' "$base_url" | sed -n 's#.*:\([0-9][0-9]*\)/.*#\1#p')
+        llama_used=
+        if in_list "$sk" local local-fast local-deep || [ "$(get_key critic)" = "local" ]; then
+          llama_used=1
+        fi
+        echo "endpoint  $base_url${llama_used:+ (remote llama-server)}${llama_used:- (not used by this panel)}"
+        case "$base_url" in
+          *://127.0.0.1:*|*://localhost:*|*://\[::1\]:*)
+            if port_listening "$port"; then
+              echo "  ok: something is listening on localhost:$port."
+            else
+              echo "  WARN: nothing listening on localhost:$port; the server or its tunnel is down."
+            fi ;;
+        esac
+        health=$(curl -sS -m 5 "$origin/health" 2>/dev/null | head -c 200 || true)
+        case "$health" in
+          *ok*|*'"status"'*) echo "  ok: server healthy." ;;
+          *) echo "  WARN: /health unreachable: ${health:-<no answer>}" ;;
+        esac
+        key_file="${FUSION_API_KEY_FILE:-$HOME/.config/llama-server/api-key}"
+        if [ -f "$key_file" ]; then
+          echo "api-key   $key_file present."
+        else
+          echo "api-key   MISSING at $key_file; requests may be rejected."
+        fi
+        r=$(resident || true)
+        echo "resident  ${r:-<none / unreachable>}"
+        if [ -z "$r" ] && [ -n "$llama_used" ]; then
+          echo "  WARN: nothing resident; local agents will fail until a model is loaded."
+        fi
+        props=$(curl -sS -m 5 -H "Authorization: Bearer $(first_key "$key_file")" "$origin/props" 2>/dev/null || true)
+        ctx=$(printf '%s' "$props" | python3 -c 'import json,sys
+try:
+    d=json.load(sys.stdin)
+    print(d.get("default_generation_settings",{}).get("n_ctx_slot") or d.get("n_ctx_slot") or "")
+except Exception: pass' 2>/dev/null)
+        if [ -n "$ctx" ]; then
+          echo "ctx       $ctx tokens per slot (from /props)"
+          declared=$(provider_json llamacpp contexts)
+          for d in $declared; do
+            [ "$d" -ge "$ctx" ] && echo "  WARN: declared $d >= per-slot $ctx; opencode may pack a prompt the server rejects."
+          done
+        else
+          echo "ctx       unknown (server did not report it); pin \"local_ctx\" in fusion.jsonc."
+        fi
+      fi
     fi
     # Graft is part of the setup: the graph lives per-project, the CLI global.
     if command -v graft >/dev/null; then
       echo "graft     $(graft --version 2>/dev/null || echo installed)"
     else
-      echo "graft     MISSING — npm install -g @nanonets/graft (agents fall back to grep until then)"
+      echo "graft     MISSING: npm install -g @nanonets/graft (agents fall back to grep until then)"
     fi
-    if command -v unshare >/dev/null && unshare --user --map-root-user --net true 2>/dev/null; then
-      echo "  ok: offline wrapper available (network isolation for graft processes)."
+    if [ "$(uname -s)" = "Darwin" ] && command -v sandbox-exec >/dev/null; then
+      echo "  ok: offline wrapper available (sandbox-exec network isolation for graft)."
+    elif [ "$(uname -s)" = "Linux" ] && command -v unshare >/dev/null && unshare --user --map-root-user --net true 2>/dev/null; then
+      echo "  ok: offline wrapper available (unshare network isolation for graft)."
     else
       echo "  WARN: network isolation unavailable; the graft wrapper refuses to run rather than go online."
     fi
     if [ -d "$PWD/graft" ]; then
       echo "  ok: graft/ index present in this project."
     else
-      echo "  note: no graft/ index in this project — run \`graft build\` here once."
+      echo "  note: no graft/ index in this project: run \`graft build\` here once."
     fi
     # rtk compresses command output before any agent reads it.
     if command -v rtk >/dev/null; then
       echo "rtk       $(rtk --version 2>/dev/null || echo installed)"
     else
-      echo "rtk       MISSING — brew install rtk (or cargo install --git https://github.com/rtk-ai/rtk)"
+      echo "rtk       MISSING: brew install rtk (or cargo install --git https://github.com/rtk-ai/rtk)"
+    fi
+    # The opencode v2 background server: started from this harness, newer
+    # than every config and plugin file, and fusion and rtk active here.
+    if command -v python3 >/dev/null; then
+      OPENCODE_CONFIG="${OPENCODE_CONFIG:-$ROOT/opencode.jsonc}" python3 "$ROOT/bin/oc-server" check "$PWD" || true
     fi
     ;;
   usage)
@@ -476,12 +788,15 @@ print(f"lead model rates ({base}): ${rin}/${rout} per M in/out")
 print(f"delegated tokens (non-lead): {fmt(shadow_in)} in / {fmt(shadow_out)} out+reasoning")
 if rin == 0 and rout == 0:
     print("shadow cost at lead rates: $0.000 (free lead: delegation saves context and")
-    print("rate-limit budget here, not money — switch base to a paid lead to price it)")
+    print("rate-limit budget here, not money; switch base to a paid lead to price it)")
 else:
     print(f"shadow cost if billed at lead rates: ${shadow:.3f}")
     print("(upper bound on what delegation saved; local agents actually cost $0)")
 PY
     ;;
+  turns)
+    # Failed tool calls per agent from the opencode server (read only).
+    shift; exec python3 "$ROOT/bin/oc-turns" "$@" ;;
   -h|--help|help) usage ;;
   *) usage; exit 1 ;;
 esac

@@ -21,6 +21,9 @@ local model. You get the best results by working *with* that split:
 - Give the task and its acceptance check, not a step-by-step procedure.
   The lead decides what to delegate; a procedure tempts it to do everything
   itself.
+- The lead is the only seat that spawns, escalates, or files work orders.
+  `scout`, `critic`, and `oracle` are read-only and share a narrow shell
+  allowlist; `grunt` edits and runs shell but cannot spawn.
 - Long output is handled for you: huge results go to a file and the lead
   sends scout at it; merely-large ones get summarized with head/tail intact.
 - Before you accept non-trivial work, ask for a critic pass. (`critic` is
@@ -35,7 +38,15 @@ oc-fusion critic local|flash|lead   # who reviews diffs — see README
 oc-fusion speed fast                # faster session: -1 reasoning notch on the lead
 oc-fusion escalation advise|run|fable
 oc-fusion routing observe|enforce   # measured stalls/scope: annotate vs block
+oc-fusion doctor                    # config vs the live server, incl. every model's ctx
 ```
+
+`oc-fusion doctor` is the one to run after any context change. It reads each
+llama-swap unit's `-c` and each model's `limit` in the global provider config,
+then flags a limit above the server's context (the server rejects the tail) or
+an `input` well under it (compaction throws away window). A model whose
+`limit.input` is stale compacts early even though the server has room: Sage Q5
+ran at 160K while its limit still said 64K, so sessions compacted near 40K.
 
 - **`base union-alpha`** runs the week's free lead: OpenCode Zen's stealth
   model for agentic coding, $0 in / $0 out. It advertises no reasoning
@@ -104,8 +115,18 @@ climbing over sessions, it's under-delegating; say so to it.
 
 ## Things that bite
 
-- **Concurrent local calls queue.** One llama-server slot: a fan-out of six
-  scouts serializes. Two or three parallel tasks are fine.
+- **Concurrent local calls do not overlap.** One llama-server or Strata
+  slot, and the harness refuses a second local subagent while one is
+  running. Dispatch one, wait for it to return, then dispatch the next: a
+  fan-out of six scouts is five refusals, not a queue. The paid oracle may
+  run beside a local one.
+- **The lead waits while its subagent uses a one-slot local model.** On a
+  one-slot backend, the slot gate gives the backend to one session until its
+  run ends. A subagent goes before its parent, and other sessions wait their
+  turn. A toast names the session that holds the slot. Without the gate, the
+  sessions take turns, each request removes the other's prompt cache, and
+  every request reads its whole prompt again from token 0. Turn the gate off
+  with `"slot_gate": false` in fusion.jsonc.
 - **15 idle minutes sleeps the model.** The next scout call pays a reload
   (seconds, from page cache). First call after a break feels slow; that's
   why.
