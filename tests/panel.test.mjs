@@ -288,3 +288,19 @@ test("every TUI knob has a profile write target and non-empty options", () => {
   for (const seat of EFFORT_SEATS) assert.ok(typeof seat === "string");
   for (const level of EFFORT_LEVELS) assert.ok(typeof level === "string");
 });
+
+// ------------------------------------------------------ long_context hint ---
+
+test("longContextHint fires at the threshold on the named model only, once per session text", async () => {
+  const { longContextHint } = await import("../plugins/fusion/panel.mjs");
+  const cfg = { model: "27B", at: 30000, switch_to: "llm-swap/qwen-27b-long" };
+  const m = { id: "Qwen3.8-27B-mtp" };
+  // input plus cache.read is the prompt size
+  assert.equal(longContextHint(cfg, m, { input: 1000, cache: { read: 28000 } }), null);
+  const a = longContextHint(cfg, m, { input: 2000, cache: { read: 28000 } });
+  assert.match(a.action, /llm-swap\/qwen-27b-long/);
+  // later steps give the same text, so the notice store dedupes them
+  assert.equal(longContextHint(cfg, m, { input: 9000, cache: { read: 30000 } }).message, a.message);
+  assert.equal(longContextHint(cfg, { id: "strata-iq3" }, { input: 90000 }), null);
+  assert.equal(longContextHint(null, m, { input: 90000 }), null);
+});

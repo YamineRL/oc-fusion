@@ -69,6 +69,7 @@ import {
   readUsageRows,
   pruneOldToolOutputs,
   LEAD_RATES,
+  longContextHint,
 } from "./panel.mjs";
 
 // Machine-specific locations, overridable. Defaults follow XDG.
@@ -211,6 +212,11 @@ const DEFAULTS = {
   // wait: after it the request goes anyway.
   slot_gate: true,
   slot_wait_minutes: 60,
+  // Hint, never a switch: when a session on a short-context model nears its
+  // compaction point, name a long-context model to move to. One model swap
+  // (about 40 s) costs less than a run of compactions (minutes each).
+  // Shape: { "model": "<id or part of it>", "at": <tokens>, "switch_to": "<provider/model>" }
+  long_context: null,
 };
 
 // ------------------------------------------------------------------- helpers
@@ -2946,6 +2952,11 @@ const setupV2 = async (ctx) => {
               "Send the last request again, or lower the seat's effort in /fusion effort.",
               { sessionID: meta.session ?? event.sessionID },
             );
+          }
+          if (event.type === "session.step.ended") {
+            const hint = longContextHint(S().profile.long_context, meta.model, t);
+            if (hint) emitNotice("long-context", `${hint.message} (session ${String(meta.session ?? event.sessionID).slice(-8)})`,
+              hint.action, { sessionID: meta.session ?? event.sessionID, severity: "info" });
           }
           if (event.type === "session.step.failed" && LOCAL_PROVIDERS.includes(prov)) {
             const err = event.error ?? {};

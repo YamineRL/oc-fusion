@@ -83,6 +83,12 @@
   "slot_gate": true,
   "slot_wait_minutes": 60,
 
+  // A hint (never a switch) when a session on a short-context model nears
+  // its compaction point: one model swap costs less than repeated
+  // compactions. "model" matches part of the model id. Example:
+  //   "long_context": { "model": "qwen-27b", "at": 26000, "switch_to": "llm-swap/qwen-27b-long" },
+  "long_context": null,
+
   // Opt-in remote Strata swap, off by default. When set to an ssh
   // destination, `oc-fusion sidekick strata|strata-coder` first runs
   // `strata-use iq3|coder` on that host so the remote Strata serves the

@@ -499,3 +499,20 @@ export function readUsageRows(file, sessionID) {
     return [];
   }
 }
+
+// The long_context hint (see the profile default in index.js). Returns
+// { message, action } when the step's prompt reached cfg.at on a model whose
+// id contains cfg.model, else null. tokens is a v2 step's tokens object: the
+// prompt is the new input plus the cached part.
+export function longContextHint(cfg, model, tokens) {
+  if (!cfg || !cfg.model || !cfg.switch_to || !Number(cfg.at) || !model?.id) return null;
+  if (!String(model.id).includes(String(cfg.model))) return null;
+  const prompt = (tokens?.input ?? 0) + (tokens?.cache?.read ?? 0);
+  if (prompt < Number(cfg.at)) return null;
+  return {
+    // No token count in the text: the notice id hashes the message, so a
+    // count would repeat the notice on every step.
+    message: `This session is near the compaction point of ${model.id}.`,
+    action: `Text only? Move it to ${cfg.switch_to} (/model): one swap instead of repeated compactions. That model may not read images.`,
+  };
+}
