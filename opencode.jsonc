@@ -65,6 +65,15 @@
   // server starts and advertises no tools; the agents fall back to grep/scout.
   // Restart opencode after any change to this block.
   "mcp": {
+    // Opt-in: executor (npm "executor", MIT) gives grunt/scout one typed
+    // tool surface instead of many shell calls. Off by default. To try it:
+    // `npm i -g executor@1.6.11`, set "enabled": true, then compare
+    // `oc-fusion turns` before and after.
+    "executor": {
+      "type": "local",
+      "command": ["executor", "mcp"],
+      "enabled": false
+    },
     "graft": {
       "type": "local",
       "command": ["oc-fusion", "graft", "mcp"],

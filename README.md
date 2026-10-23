@@ -423,6 +423,66 @@ local one. This is in the lead's prompt. Need real burst parallelism? Point
 `sidekick` at a cheap flash-class API model instead; that is exactly what
 that knob is for.
 
+## The gate (one queue for every client)
+
+`gate/gate.mjs` is a small proxy that sits in front of the model server
+(llama-swap, Strata or llama-server). Every model request from every client
+(opencode, a web UI, scripts) goes through one queue, one at a time, and a
+running request is never cut off. Requests are "owner" (yours) or "seat"
+(background agents, by header `X-Strata-Class: seat` or by an agent named
+like a file in `GATE_SEATS_DIR`). Owner requests go first, and after one
+ends seats wait a grace window (`OWNER_GRACE_S`, default 180 s), so a
+background prompt cannot replace the prompt cache between two of your steps.
+Waiting streams get keepalive comments. `GET /gate/status` shows the queue.
+
+Install: copy `gate/strata-gate.service` to `~/.config/systemd/user/`, set
+the ports in it, `systemctl --user enable --now strata-gate`, and point
+clients at the gate port. Tests: `node --test tests/gate.test.mjs`.
+
+With llama-swap behind the gate you can keep two profiles of the same 27B:
+a fast one with MTP and the vision projector (45K context), and a `-long`
+one (96K, q8_0 KV, no projector: it cannot see images). Set
+`long_context` in `fusion.jsonc` and the panel tells you when a session on
+the fast profile grows past the threshold and should move to `-long`.
+
+## Compaction limits
+
+opencode v2 compacts at `(limit.input || limit.context) - compaction.reserved`.
+The summary may use at most `min(limit.output, 32000, limit.context - start)`
+tokens. So set the start with `limit.input`, keep `limit.context` at the real
+server context, and leave room: a thinking model spends its budget before it
+writes the summary. `oc-fusion doctor` prints `compacts@X summary=Y` per model
+and flags a summary budget under 16000. Its "not-ok" is advice: it reads
+the server context from your unit or swap config, which can be wrong.
+
+## Turns report
+
+`oc-fusion turns [--hours N] [--dir D]` reads the local server's sessions
+and counts, per agent, tool calls, failures and wasted turns (permission
+rejects, tool errors, incomplete input), with the median step time and the
+minutes lost. On a local model each wasted turn costs 30 to 90 s, so this
+is the list of prompt and permission fixes worth doing first.
+
+## Skills and opt-in tools
+
+`scripts/install-skills.sh` installs Cloudflare's
+[security-audit skill](https://github.com/cloudflare/security-audit-skill)
+(MIT) into `~/.config/opencode/skills/`, pinned to a reviewed commit
+(override with `SECURITY_AUDIT_REV`). Ask the critic or oracle for a
+security review and opencode loads it.
+
+`opencode.jsonc` carries a disabled `executor` MCP entry
+([executor](https://github.com/UsefulSoftwareCo/executor), MIT). It is off
+by default. To try it, `npm i -g executor@1.6.11`, set `"enabled": true`,
+and compare `oc-fusion turns` before and after.
+
+## CI
+
+`.github/workflows/ci.yml` runs on every push and PR: a privacy scan
+(`scripts/privacy-scan.sh`: home paths, LAN and tailnet addresses, keys),
+shell and Python syntax checks, and `node --test tests/`. A line that must
+keep a flagged pattern carries `privacy-scan: ok`.
+
 ## Evidence routing
 
 The tier a piece of work runs on is decided by measurement, not by the lead's
@@ -634,7 +694,11 @@ plugins/fusion/index.js    routing, the guard, effort injection, compression,
                            discovery, accounting
 plugins/rtk/index.ts       vendored rtk output-compression plugin (Bash rewrite)
 bin/oc                     entry point
-bin/oc-fusion              panel CLI + doctor + usage + graft forwarder
+bin/oc-fusion              panel CLI + doctor + usage + turns + graft forwarder
+bin/oc-server              background server check and restart
+bin/oc-turns               wasted-turn report
+gate/                      strata-gate proxy and its user unit
+scripts/                   privacy scan, skill installer
 examples/llama-server.service  example local-server unit
 ```
 
