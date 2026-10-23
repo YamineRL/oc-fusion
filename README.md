@@ -3,13 +3,13 @@
 A two-tier coding harness for [opencode](https://opencode.ai), built around
 local inference you already own.
 
-A strong lead model does the thinking — frontier-class in the on-par
-configuration, GLM-5.3-class as the sensible floor. A model on your own GPU —
-or a cheap flash-class API model — does the reading, searching, mechanical
+A strong lead model does the thinking (frontier-class in the on-par
+configuration, GLM-5.3-class as the sensible floor). A model on your own GPU
+(or a cheap flash-class API model) does the reading, searching, mechanical
 editing, and test-running. What the lead cannot crack goes to a Claude Code
 subscription you already pay for, instead of a per-token frontier fallback.
 And under both tiers, a local [Graft](https://github.com/trailhq/Graft) graph
-maps every project — symbols, call edges, exact file:line — while
+maps every project (symbols, call edges, exact file:line) while
 [rtk](https://github.com/rtk-ai/rtk) compresses command output before any
 agent reads it. No agent re-explores the repo from zero, and no agent reads
 two hundred lines to learn a test failed.
@@ -26,7 +26,7 @@ measurements and are marked as such.
 
 Most tokens in a coding session are spent *reading* things, not reasoning
 about them. This is the pattern commercial agent products converged on in
-2026 — notably Devin's Fusion, which pairs a frontier lead with a cheap
+2026, notably Devin's Fusion, which pairs a frontier lead with a cheap
 sidekick and bills per token for both. Artificial Analysis measured the
 effect there: Fable 5.1 alone cost $12.40/task, while Fable 5.1 + SWE-2 hit
 the same index score at $7.90.
@@ -48,13 +48,13 @@ Two configurations, one harness:
   sidekick that bills $0 because it is your own hardware. This is the config
   to reach for when the task is hard and you want Fusion's shape at a
   fraction of Fusion's bill.
-- **Frugal** (default): `oc-fusion base glm`. GLM-5.3 is the floor — below
+- **Frugal** (default): `oc-fusion base glm`. GLM-5.3 is the floor: below
   it you lose the "strong lead" property the architecture depends on, and
   the savings should come from the sidekick instead. Cheap flash-class
   models are for the sidekick tier, not the lead.
 - **Free lead**: `oc-fusion base union-alpha`. OpenCode Zen's stealth model
   built for agentic coding, released 2026-09-16, $0 in / $0 out. It
-  advertises no reasoning levels — the model manages its own effort, so the
+  advertises no reasoning levels: the model manages its own effort, so the
   `reasoning` knob is ignored for it (the harness sends no variant). A
   stealth model has no public benchmarks: treat it as an experiment while
   Zen keeps it free, not as a floor replacement. Use it when the lead
@@ -62,7 +62,7 @@ Two configurations, one harness:
   cutting it.
 
 The sidekick is where the money is. If you run a local inference server at
-all, the marginal cost of a sidekick token is zero — and the harness
+all, the marginal cost of a sidekick token is zero, and the harness
 discovers whatever model your server has resident, so it never asks for a
 model that isn't loaded.
 
@@ -95,7 +95,7 @@ llama.cpp stays fully supported.
 | `oracle` | frontier| **off by default.** Paid, read-only; only when `escalation` is `fable` |
 
 `scout` is where the savings are. The lead never burns its own context reading
-a 3000-line file to find one function — and with a `graft/` index in the
+a 3000-line file to find one function. And with a `graft/` index in the
 project, it often skips the file read entirely: the graph answers with exact
 file:line and the crux lines inline, so a find/trace becomes one tool call
 instead of a browse.
@@ -545,7 +545,7 @@ brief asks for.
 ## Graft (the repo graph)
 
 [Graft](https://github.com/trailhq/Graft) is the third tier: a repo context
-graph as a folder of linked markdown — a local, regenerable cache that every
+graph as a folder of linked markdown: a local, regenerable cache that every
 query keeps in sync with the code. It is part of the setup, not an add-on:
 the graph lives in **your project**, never in the harness, and its core
 needs no LLM and no key. Agents use the graft tools first and fall back to
@@ -553,8 +553,8 @@ grep only where a project has no `graft/` index yet.
 
 - **Install once, globally**: `npm install -g @nanonets/graft` (Node 20+).
   On a new machine, `oc-fusion doctor` nags you until it's there.
-- **Build in the project you work in**: `graft build`. The structural pass —
-  wiring graph plus per-file cards — is $0 and keyless. `--deep` adds the
+- **Build in the project you work in**: `graft build`. The structural pass
+  (wiring graph plus per-file cards) is $0 and keyless. `--deep` adds the
   LLM concept map and per-symbol summaries; it needs a provider key, and
   nothing in this harness runs it automatically.
 - **Query locally**: `graft ask "..."`, `graft grep <pattern>`, `graft map`,
@@ -563,17 +563,17 @@ grep only where a project has no `graft/` index yet.
 - **MCP**: `opencode.jsonc` registers `graft mcp` as a local stdio server,
   launched through the same offline wrapper as the CLI (below). OpenCode
   starts it with the session's project directory as its cwd, so it indexes
-  whatever repo you have open — no path is hardcoded, and the harness
+  whatever repo you have open: no path is hardcoded, and the harness
   directory is never the target. The agents then get `graft_repo_map`,
   `graft_find_code`, `graft_find_all`, `graft_trace_calls`, `graft_file_api`
   and `graft_check_freshness`. In a project with no `graft/` index the
   server starts and advertises no tools; the agents fall back to grep and
   scout.
-- **CLI fallback**: the same queries run from the shell — `oc-fusion graft
-  map`, `oc-fusion graft ask "..."` — forwarded to the `graft` CLI in your
+- **CLI fallback**: the same queries run from the shell (`oc-fusion graft
+  map`, `oc-fusion graft ask "..."`), forwarded to the `graft` CLI in your
   current project, not the harness root.
-- **Privacy**: every graft process Fusion starts — MCP server or CLI
-  forward — runs through a Linux `unshare` wrapper that removes network
+- **Privacy**: every graft process Fusion starts (MCP server or CLI
+  forward) runs through a Linux `unshare` wrapper that removes network
   access for the process **and its children** (Graft's daily npm update
   check survives `DO_NOT_TRACK` otherwise), sets `DO_NOT_TRACK=1` for its
   anonymous usage stats, and refuses `--deep` so no provider-backed LLM
@@ -587,8 +587,8 @@ every other config change in this harness.
 ## rtk (the output tier)
 
 [rtk](https://github.com/rtk-ai/rtk) compresses command output before any
-agent reads it — `git status` to a stat line, test runs to failures only,
-listings to tree summaries — a single Rust binary, <10ms overhead. It is
+agent reads it (`git status` to a stat line, test runs to failures only,
+listings to tree summaries). A single Rust binary, <10ms overhead. It is
 part of the setup, and it covers **every** agent in the harness: lead,
 sidekick, subagents, because it rewrites at the Bash tool layer, not per
 agent.
@@ -602,14 +602,14 @@ agent.
   PATH → the plugin disables itself and commands run unchanged; a failed
   rewrite passes through. Nothing is written into your global config.
 - **What it saves**: the numbers rtk reports are reductions in **bash
-  output**, not in your bill — bash output is one contributor among
+  output**, not in your bill: bash output is one contributor among
   prompt, history, and output tokens. Percentages are reliable, absolute
   token counts are estimated (bytes/4).
 - **Division of labour**: rtk compresses at the source, before output
   reaches a model. The harness's `compress_tool_output` knob still exists
   for large-but-intact output rtk passes through (it runs after rtk, and
   only in paid sessions). Truncated-to-file output still goes to scout
-  with the path — that route is lossless and free. `rtk recall <id>`
+  with the path: that route is lossless and free. `rtk recall <id>`
   recovers the full output of a failed command rtk compacted.
 - **Privacy**: this rtk build ships no telemetry endpoint (verify with
   `rtk telemetry status`); its usage stats are local, and `rtk gain`
@@ -623,7 +623,7 @@ change in this harness.
 Every completed assistant message is logged to `.fusion/usage.jsonl` in the
 project directory: timestamp, session, agent, model, input/output/reasoning
 tokens, cache read/write, and cost. `oc-fusion usage` aggregates it per agent
-and prints a shadow line — what the delegated (non-lead) tokens would have
+and prints a shadow line: what the delegated (non-lead) tokens would have
 cost at lead rates. That shadow is the *ceiling* of what delegation saved,
 not a claim: it over-counts because a lead would not re-read everything the
 sidekick read, and local-agent `in` can under-count because llama.cpp bills
@@ -716,4 +716,4 @@ affiliated with Cognition.
 
 ## License
 
-GPL-3.0 — see LICENSE.
+GPL-3.0: see LICENSE.
