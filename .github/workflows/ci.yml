@@ -19,4 +19,4 @@ jobs:
       - name: python syntax
         run: python3 -m py_compile bin/oc-server
       - name: tests
-        run: node --test tests/
+        run: node --test tests/*.test.mjs
