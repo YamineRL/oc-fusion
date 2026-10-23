@@ -58,7 +58,7 @@
   // Local repo context graph: https://github.com/trailhq/Graft
   // `graft mcp` is a stdio server that indexes the graph of the project you have
   // open: opencode starts it with the session's project directory as its cwd, and
-  // graft resolves the nearest graft/ index from there — so whatever repo you work
+  // graft resolves the nearest graft/ index from there, so whatever repo you work
   // in is what gets indexed, and no path is pinned in this file. Needs the global
   // graft CLI (`npm install -g @nanonets/graft`) and a `graft/` index in the
   // project (`graft build`, structural, no LLM, no key). Without an index the

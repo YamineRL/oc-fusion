@@ -15,7 +15,7 @@ Nothing to boot: llama-server is a systemd user service. After a reboot,
 ## Day to day
 
 Talk to the lead. It plans, makes the subtle edits itself, and delegates the
-volume — reading, searching, mechanical changes, test loops — to the free
+volume, reading, searching, mechanical changes, test loops, to the free
 local model. You get the best results by working *with* that split:
 
 - Give the task and its acceptance check, not a step-by-step procedure.
@@ -34,7 +34,7 @@ local model. You get the best results by working *with* that split:
 ```
 oc-fusion status                    # what's live
 oc-fusion base union-alpha|glm|fable|...   # lead; union-alpha is the free Zen stealth model
-oc-fusion critic local|flash|lead   # who reviews diffs — see README
+oc-fusion critic local|flash|lead   # who reviews diffs, see README
 oc-fusion speed fast                # faster session: -1 reasoning notch on the lead
 oc-fusion escalation advise|run|fable
 oc-fusion routing observe|enforce   # measured stalls/scope: annotate vs block
@@ -51,16 +51,16 @@ ran at 160K while its limit still said 64K, so sessions compacted near 40K.
 - **`base union-alpha`** runs the week's free lead: OpenCode Zen's stealth
   model for agentic coding, $0 in / $0 out. It advertises no reasoning
   levels, so `oc-fusion reasoning ...` is a no-op for it (the model manages
-  its own effort). No public benchmarks — if it disappoints on a task, flip
+  its own effort). No public benchmarks, if it disappoints on a task, flip
   back with `oc-fusion base glm` mid-week; the panel is just a config edit.
 - **`critic lead`** is worth setting when the work is subtle: the lead
   re-reads its own diff at low effort, sub-cent per review.
 - **`escalation advise`** (default) is usually right. When the lead gets
   stuck it writes `.fusion/escalation-<time>.md` and prints the exact
-  `claude` command — run it if you want Claude Code's answer (billed to
+  `claude` command, run it if you want Claude Code's answer (billed to
   your subscription, not the gateway). `run` does that automatically,
   `fable` spends gateway balance.
-- A `fusion.jsonc` in the project you're working in overrides the panel —
+- A `fusion.jsonc` in the project you're working in overrides the panel:
   that's per-repo pinning, but it also means a stray file silently wins.
 - **`routing enforce`** turns the measured gates into hard blocks: identical
   commands that already failed `stall_commands` times are refused, a file a
@@ -74,7 +74,7 @@ ran at 160K while its limit still said 64K, so sessions compacted near 40K.
 ## Graft (repo graph)
 
 [Graft](https://github.com/trailhq/Graft) adds a local
-context graph over **the project you have open** — a regenerable cache of
+context graph over **the project you have open**, a regenerable cache of
 linked markdown, no LLM, no key. It is part of the setup: the agents get
 graft_* tools for orientation, locating, and blast radius, and only fall
 back to grep and scout in a project that has no graph yet.
@@ -86,7 +86,7 @@ cd <yourproject> && graft build     # structural pass, $0
 
 Then restart opencode (`mcp.graft` in `opencode.jsonc` is read at startup).
 From the shell, `oc-fusion graft <build|check|map|ask|grep|skeleton|callers>
-[args...]` runs graft in the project you're standing in — through an
+[args...]` runs graft in the project you're standing in, through an
 offline wrapper: no network for graft or its children, `DO_NOT_TRACK=1`,
 and `--deep` refused (use plain `graft` outside the harness if you
 explicitly want the provider-backed LLM pass; nothing runs it for you).
@@ -96,10 +96,10 @@ explicitly want the provider-backed LLM pass; nothing runs it for you).
 [rtk](https://github.com/rtk-ai/rtk) rewrites Bash commands through the
 vendored plugin before they run: `git status` becomes a stat line, test
 runs collapse to failures, listings become trees. It applies to every
-agent — the sidekick reading test output benefits as much as the lead.
+agent, the sidekick reading test output benefits as much as the lead.
 `brew install rtk` once; `oc-fusion doctor` reports it. If rtk is
 missing, commands run unchanged (the plugin disables itself). The full
-output of a failed command is recoverable with `rtk recall <id>` — the
+output of a failed command is recoverable with `rtk recall <id>`, the
 compacted line carries the id. `rtk gain` shows what it saved, locally.
 
 ## Watching the money
@@ -109,7 +109,7 @@ oc-fusion usage
 ```
 
 Per-agent tokens and cost from `.fusion/usage.jsonl`, plus the shadow line:
-what the delegated tokens *would* have cost at lead rates — the ceiling of
+what the delegated tokens *would* have cost at lead rates, the ceiling of
 what delegation saved, not a claim. If the lead's share of total tokens is
 climbing over sessions, it's under-delegating; say so to it.
 

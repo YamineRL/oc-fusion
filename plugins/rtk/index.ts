@@ -6,10 +6,10 @@ import type { Plugin } from "@opencode-ai/plugin"
 // into the user's global config on install.
 //
 // It rewrites shell tool commands to their `rtk` equivalents before they
-// run, so every agent — lead, sidekick, subagent — reads compressed
+// run, so every agent, lead, sidekick, subagent, reads compressed
 // output. All rewrite logic lives in `rtk rewrite` (the Rust registry in
 // rtk's src/discover/registry.rs); this file only delegates. To add or
-// change rewrite rules, update rtk — not this file.
+// change rewrite rules, update rtk, not this file.
 //
 // Graceful degradation: no rtk in PATH → the plugin disables itself and
 // commands run unchanged. A failed rewrite passes the command through.
@@ -22,7 +22,7 @@ export const RtkOpenCodePlugin: Plugin = async ({ $ }) => {
   try {
     await $`which rtk`.quiet()
   } catch {
-    console.warn("[rtk] rtk binary not found in PATH — plugin disabled")
+    console.warn("[rtk] rtk binary not found in PATH, plugin disabled")
     return {}
   }
 
@@ -43,7 +43,7 @@ export const RtkOpenCodePlugin: Plugin = async ({ $ }) => {
           ;(args as Record<string, unknown>).command = rewritten
         }
       } catch {
-        // rtk rewrite failed — pass through unchanged
+        // rtk rewrite failed, pass through unchanged
       }
     },
   }
