@@ -1,0 +1,22 @@
+name: ci
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: privacy scan
+        run: scripts/privacy-scan.sh
+      - name: shell syntax
+        run: bash -n bin/oc bin/oc-fusion
+      - name: python syntax
+        run: python3 -m py_compile bin/oc-server
+      - name: tests
+        run: node --test tests/
