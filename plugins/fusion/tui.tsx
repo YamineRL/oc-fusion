@@ -228,7 +228,7 @@ export default Plugin.define({
           return;
         }
         const seat = await dialog.select({
-          title: "/fusion effort — pick a seat",
+          title: "/fusion effort, pick a seat",
           options: r.seats.map((s) => ({ value: s.seat, title: s.seat, description: `now: ${s.current}` })),
           current: direct || undefined,
         });
@@ -262,7 +262,7 @@ export default Plugin.define({
       const value =
         direct ||
         (await dialog.select({
-          title: `/fusion ${sub} — ${r.label ?? sub}`,
+          title: `/fusion ${sub}, ${r.label ?? sub}`,
           options: r.options.map((o) => ({
             value: o.value,
             title: o.value === r.current ? `${o.title}  (current)` : o.title,
