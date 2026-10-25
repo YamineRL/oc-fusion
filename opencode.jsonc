@@ -246,6 +246,11 @@
           "rg *": "allow", "grep *": "allow", "fd *": "allow",
           "ls *": "allow", "cat *": "allow", "sed -n *": "allow",
           "wc *": "allow", "head *": "allow", "tail *": "allow",
+          // The rtk plugin rewrites ls, rg, cat, head, grep, wc and git into
+          // "rtk ..." BEFORE the permission check (2026-10-25: scout denied).
+          "rtk ls *": "allow", "rtk rg *": "allow", "rtk read *": "allow",
+          "rtk grep *": "allow", "rtk wc *": "allow", "rtk git log*": "allow",
+          "rtk git diff*": "allow", "rtk git show*": "allow",
           // Graft read-query forms only (via the harness forwarder): locate,
           // trace, orient. Never build/init/uninstall. Queries may refresh the
           // local graft/ cache: a structural local rebuild, not a write to the
@@ -295,6 +300,11 @@
           "rg *": "allow", "grep *": "allow", "fd *": "allow",
           "ls *": "allow", "cat *": "allow", "sed -n *": "allow",
           "wc *": "allow", "head *": "allow", "tail *": "allow",
+          // The rtk plugin rewrites ls, rg, cat, head, grep, wc and git into
+          // "rtk ..." BEFORE the permission check (2026-10-25: scout denied).
+          "rtk ls *": "allow", "rtk rg *": "allow", "rtk read *": "allow",
+          "rtk grep *": "allow", "rtk wc *": "allow", "rtk git log*": "allow",
+          "rtk git diff*": "allow", "rtk git show*": "allow",
           "oc-fusion graft ask*": "allow",
           "oc-fusion graft grep*": "allow",
           "oc-fusion graft skeleton*": "allow",
@@ -324,6 +334,11 @@
           "rg *": "allow", "grep *": "allow", "fd *": "allow",
           "ls *": "allow", "cat *": "allow", "sed -n *": "allow",
           "wc *": "allow", "head *": "allow", "tail *": "allow",
+          // The rtk plugin rewrites ls, rg, cat, head, grep, wc and git into
+          // "rtk ..." BEFORE the permission check (2026-10-25: scout denied).
+          "rtk ls *": "allow", "rtk rg *": "allow", "rtk read *": "allow",
+          "rtk grep *": "allow", "rtk wc *": "allow", "rtk git log*": "allow",
+          "rtk git diff*": "allow", "rtk git show*": "allow",
           "oc-fusion graft ask*": "allow",
           "oc-fusion graft grep*": "allow",
           "oc-fusion graft skeleton*": "allow",
