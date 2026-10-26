@@ -20,6 +20,7 @@ const MENU = [
   { value: "reasoning", title: "reasoning", description: "Lead model effort" },
   { value: "speed", title: "speed", description: "normal or fast" },
   { value: "escalation", title: "escalation", description: "advise, run (Claude Code) or fable (paid oracle)" },
+  { value: "models", title: "models", description: "Refresh the list of every model your providers offer (used by /fusion base)" },
   { value: "doctor", title: "doctor", description: "Run the full harness health check" },
   { value: "help", title: "help", description: "What each /fusion command does" },
 ];
@@ -35,6 +36,7 @@ const HELP = [
   "  reasoning    lead model effort",
   "  speed        fast = one notch less reasoning and a tighter step budget",
   "  escalation   advise = write a Claude Code brief; run = run claude -p after asking; fable = paid oracle",
+  "  models       refresh the full model list that /fusion base shows",
   "  doctor       run oc-fusion doctor and show the output",
   "",
   "Type /fusion alone to get the menu. Changes write fusion.jsonc and apply",
@@ -210,6 +212,17 @@ export default Plugin.define({
         if (st) await dialog.alert({ title: "fusion status", message: statusText(st) });
         return;
       }
+      if (sub === "models") {
+        const r = (await rpc.models({}).catch((e: { message?: string }) => ({ ok: false, error: e?.message ?? String(e) }))) as {
+          ok?: boolean; count?: number; providers?: number; error?: string;
+        };
+        toast.show(
+          r.ok
+            ? { variant: "success", title: "fusion", message: `model list updated: ${r.count} models from ${r.providers} providers` }
+            : { variant: "error", title: "fusion", message: `model list refresh failed: ${r.error}` },
+        );
+        return;
+      }
       if (sub === "doctor") {
         toast.show({ message: "running oc-fusion doctor…", variant: "info" });
         const r = await rpc.doctor({}).catch((e: { message?: string }) => {
@@ -252,7 +265,7 @@ export default Plugin.define({
         label?: string;
         help?: string;
         current?: string;
-        options?: { value: string; title: string; description?: string; footer?: string }[];
+        options?: { value: string; title: string; description?: string; footer?: string; category?: string }[];
         error?: string;
       } | null;
       if (!r || r.error || !r.options?.length) {
@@ -268,6 +281,7 @@ export default Plugin.define({
             title: o.value === r.current ? `${o.title}  (current)` : o.title,
             description: o.description,
             footer: o.footer,
+            category: o.category,
           })),
           current: r.current,
         }));

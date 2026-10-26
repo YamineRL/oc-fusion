@@ -7,12 +7,16 @@
   // configs. Flash-class models belong in "sidekick", not here.
   //   union-alpha  opencode/union-alpha  $0/$0  free Zen stealth lead,
   //                                   no effort levels: "reasoning" is ignored
-  //   glm       zai/glm-5.3          $0.70/$2.20   efforts: low high max
-  //   glm-flash zai/glm-5.3-flash    $0.015/$0.05  efforts: low high max
-  //   fable     claude-fable-5-1     $10/$50       + medium xhigh
-  //   astra     gpt-6-astra          $10/$50       + medium xhigh
-  //   sol       gpt-5.6-sol          $5/$30        + none medium xhigh
-  //   opus      claude-opus-5        $5/$25        + medium xhigh
+  //   glm       zai/glm-5.3            $0.70/$2.20   efforts: low high max
+  //   glm-flash zai/glm-5.3-flash      $0.015/$0.05  efforts: low high max
+  //   kimi      moonshot/kimi-k3.1-pro $2/$10        efforts: low high max
+  //   sonnet    claude-sonnet-5-5      $2/$10        + medium xhigh
+  //   opus      claude-opus-5-5        $4/$20        + medium xhigh
+  //   fable     claude-fable-5-1       $10/$50       + medium xhigh
+  //   sol       gpt-6.1-sol            $2/$10        + none medium xhigh
+  //   astra     gpt-6-astra            $10/$50       + medium xhigh
+  // Any "provider/model" id also works (e.g. one of your opencode favourites).
+  // /fusion base lists your favourites and recents first.
   "base": "glm",
 
   // Lead reasoning level: low | medium | high | xhigh | max
