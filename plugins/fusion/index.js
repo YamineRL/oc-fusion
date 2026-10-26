@@ -70,6 +70,10 @@ import {
   pruneOldToolOutputs,
   LEAD_RATES,
   longContextHint,
+  resolveBase,
+  readModelState,
+  readModelCache,
+  refreshModelCache,
 } from "./panel.mjs";
 
 // Machine-specific locations, overridable. Defaults follow XDG.
@@ -98,12 +102,14 @@ const BASES = {
   // advertises no levels, so its ladder is empty: the model manages its own
   // effort and the harness must send no variant for it.
   "union-alpha": { model: "opencode/union-alpha", efforts: [], free: true },
-  glm:       { model: "merge-gateway/zai/glm-5.3",              efforts: ["low", "high", "max"] },
-  "glm-flash": { model: "merge-gateway/zai/glm-5.3-flash",      efforts: ["low", "high", "max"] },
-  fable:     { model: "merge-gateway/anthropic/claude-fable-5-1", efforts: ["low", "medium", "high", "xhigh", "max"] },
-  astra:     { model: "merge-gateway/openai/gpt-6-astra",       efforts: ["low", "medium", "high", "xhigh", "max"] },
-  sol:       { model: "merge-gateway/openai/gpt-5.6-sol",       efforts: ["none", "low", "medium", "high", "xhigh", "max"] },
-  opus:      { model: "merge-gateway/anthropic/claude-opus-5",  efforts: ["low", "medium", "high", "xhigh", "max"] },
+  glm:       { model: "merge-gateway/zai/glm-5.3",                 efforts: ["low", "high", "max"] },
+  "glm-flash": { model: "merge-gateway/zai/glm-5.3-flash",         efforts: ["low", "high", "max"] },
+  kimi:      { model: "merge-gateway/moonshot/kimi-k3.1-pro",      efforts: ["low", "high", "max"] },
+  sonnet:    { model: "merge-gateway/anthropic/claude-sonnet-5-5", efforts: ["low", "medium", "high", "xhigh", "max"] },
+  opus:      { model: "merge-gateway/anthropic/claude-opus-5-5",   efforts: ["low", "medium", "high", "xhigh", "max"] },
+  fable:     { model: "merge-gateway/anthropic/claude-fable-5-1",  efforts: ["low", "medium", "high", "xhigh", "max"] },
+  sol:       { model: "merge-gateway/openai/gpt-6.1-sol",          efforts: ["none", "low", "medium", "high", "xhigh", "max"] },
+  astra:     { model: "merge-gateway/openai/gpt-6-astra",          efforts: ["low", "medium", "high", "xhigh", "max"] },
 };
 
 // The gateway only publishes vendor `-fast` twins for a few older models.
@@ -520,11 +526,11 @@ async function resolveFusion(directory) {
     if (unit.parallel == null) unit.parallel = slots;
   }
 
-  const base = BASES[profile.base] ?? BASES[DEFAULTS.base];
-  if (!BASES[profile.base]) {
+  const base = resolveBase(profile.base, BASES) ?? BASES[DEFAULTS.base];
+  if (!resolveBase(profile.base, BASES)) {
     console.error(`[fusion] unknown base "${profile.base}", falling back to "${DEFAULTS.base}". Known: ${Object.keys(BASES).join(", ")}`);
   }
-  const oracleBase = BASES[profile.oracle] ?? BASES.fable;
+  const oracleBase = resolveBase(profile.oracle, BASES) ?? BASES.fable;
   const oracleEffort = clampEffort("max", oracleBase.efforts);
   const fast = profile.speed === "fast";
 
@@ -2806,7 +2812,23 @@ const setupV2 = async (ctx) => {
     });
 
   try {
+    // Favourites and recents from opencode, plus the cached full catalog.
+    // A cache older than a day refreshes in the background.
+    const pickerState = () => {
+      const cache = readModelCache();
+      if (Date.now() - cache.fetched > 86400000) {
+        void refreshModelCache({ directory: ctx.directory }).catch((e) => console.error(`[fusion] model list refresh: ${e.message}`));
+      }
+      return { ...readModelState(), all: cache.models };
+    };
     const rpcReg = await ctx.rpc.register(FUSION_RPC, {
+      models: async () => {
+        try {
+          return { ok: true, ...(await refreshModelCache({ directory: ctx.directory })) };
+        } catch (e) {
+          return { ok: false, error: String(e?.message ?? e) };
+        }
+      },
       status: async ({ sessionID } = {}) => buildStatus(sessionID),
       choices: async ({ key } = {}) => {
         const { profile } = S();
@@ -2835,7 +2857,7 @@ const setupV2 = async (ctx) => {
           label: knob.label,
           help: knob.help,
           current: profile[knob.write],
-          options: knob.options(BASES, SIDEKICKS),
+          options: knob.options(BASES, SIDEKICKS, pickerState()),
         };
       },
       set: async ({ key, value } = {}, callCtx) => {
@@ -2865,8 +2887,10 @@ const setupV2 = async (ctx) => {
         if (!knob) {
           return callCtx.error("bad-key", `"${key}" is not a control. Valid: ${Object.keys(KNOBS).join(", ")}.`);
         }
-        const valid = knob.options(BASES, SIDEKICKS).map((o) => o.value);
-        if (!valid.includes(value)) {
+        const valid = knob.options(BASES, SIDEKICKS, pickerState()).map((o) => o.value);
+        // A lead may also be any provider/model id, not only a listed one.
+        const anyModel = (key === "base" || key === "oracle") && resolveBase(value, BASES);
+        if (!valid.includes(value) && !anyModel) {
           return callCtx.error("bad-value", `"${value}" is not a valid ${knob.label.toLowerCase()}. Valid: ${valid.join(", ")}.`);
         }
         if (!writePanelKey(file, knob.write, value)) {

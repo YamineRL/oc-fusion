@@ -304,3 +304,48 @@ test("longContextHint fires at the threshold on the named model only, once per s
   assert.equal(longContextHint(cfg, { id: "strata-iq3" }, { input: 90000 }), null);
   assert.equal(longContextHint(null, m, { input: 90000 }), null);
 });
+
+test("base picker: favourites, then recents, then leads; aliases win, no duplicates", async () => {
+  const { baseOptions, resolveBase } = await import("../plugins/fusion/panel.mjs");
+  const bases = {
+    glm: { model: "merge-gateway/zai/glm-5.3", efforts: ["low", "high", "max"] },
+    opus: { model: "merge-gateway/anthropic/claude-opus-5-5", efforts: ["low", "max"] },
+  };
+  const opts = baseOptions(bases, {
+    favorite: ["merge-gateway/anthropic/claude-opus-5-5", "llm-swap/strata-iq3"],
+    recent: ["llm-swap/strata-iq3", "opencode/x-free", "not-an-id"],
+  });
+  assert.deepEqual(
+    opts.map((o) => [o.category, o.value, o.footer]),
+    [
+      ["Favourites", "opus", "$4/$20"],
+      ["Favourites", "llm-swap/strata-iq3", "local"],
+      ["Recent", "opencode/x-free", "free"],
+      ["Lead models", "glm", "$0.7/$2.2"],
+    ],
+  );
+  assert.equal(resolveBase("not-an-id", bases), null);
+  assert.equal(resolveBase("merge-gateway/openai/gpt-7", bases).efforts[0], "none");
+});
+
+test("base picker: full catalog rows land per provider after the leads, with their price", async () => {
+  const { baseOptions, catalogRows } = await import("../plugins/fusion/panel.mjs");
+  const bases = { glm: { model: "merge-gateway/zai/glm-5.3", efforts: [] } };
+  const all = catalogRows({
+    data: [
+      { providerID: "merge-gateway", id: "zai/glm-5.3", cost: [{ input: 0.7, output: 2.2 }] },
+      { providerID: "moonshotai", id: "kimi-k3.1-pro", cost: [{ input: 2, output: 10 }] },
+      { providerID: "llm-swap", id: "strata-iq3" },
+      { id: "no-provider" },
+    ],
+  });
+  const opts = baseOptions(bases, { favorite: [], recent: [], all });
+  assert.deepEqual(
+    opts.map((o) => [o.category, o.value, o.title, o.footer]),
+    [
+      ["Lead models", "glm", "glm", "$0.7/$2.2"],
+      ["All: llm-swap", "llm-swap/strata-iq3", "strata-iq3", "local"],
+      ["All: moonshotai", "moonshotai/kimi-k3.1-pro", "kimi-k3.1-pro", "$2/$10"],
+    ],
+  );
+});

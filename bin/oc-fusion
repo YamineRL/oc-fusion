@@ -8,7 +8,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PROFILE="${FUSION_PROFILE:-$ROOT/fusion.jsonc}"
 UNIT="$HOME/.config/systemd/user/llama-server.service"
 
-BASES="union-alpha glm glm-flash fable astra sol opus"
+BASES="union-alpha glm glm-flash kimi sonnet opus fable sol astra"
 GRAFT_CMDS="build check map ask grep skeleton callers blast mcp"
 SIDEKICKS="local local-fast local-deep glm deepseek strata strata-coder"
 CRITICS="local strata flash lead"
@@ -370,7 +370,8 @@ case "$cmd" in
     ;;
   base|oracle)
     [ $# -ge 2 ] || die "usage: oc-fusion $cmd <$(echo $BASES | tr ' ' '|')>"
-    in_list "$2" $BASES || die "unknown model \"$2\". Known: $BASES"
+    # An alias, or any provider/model id (as in opencode's model list).
+    in_list "$2" $BASES || case "$2" in */*) ;; *) die "unknown model \"$2\". Known: $BASES, or a provider/model id" ;; esac
     set_key "$cmd" "$2" yes ;;
   sidekick)
     [ $# -ge 2 ] || die "usage: oc-fusion sidekick <$(echo $SIDEKICKS | tr ' ' '|')>"
@@ -750,7 +751,8 @@ from collections import defaultdict
 path, base = sys.argv[1], sys.argv[2]
 # Lead rates ($/M in, $/M out) -- keep in step with the table in fusion.js.
 LEAD = {"union-alpha": (0, 0), "glm": (0.70, 2.20), "glm-flash": (0.015, 0.05),
-        "fable": (10, 50), "astra": (10, 50), "sol": (5, 30), "opus": (5, 25)}
+        "kimi": (2, 10), "sonnet": (2, 10), "opus": (4, 20), "fable": (10, 50),
+        "sol": (2, 10), "astra": (10, 50)}
 rin, rout = LEAD.get(base, LEAD["glm"])
 
 rows = []

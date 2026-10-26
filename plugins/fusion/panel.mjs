@@ -26,6 +26,11 @@ export const FUSION_RPC = {
       input: obj({ sessionID: str() }),
       output: obj({}, { additionalProperties: true }),
     },
+    // Re-read every provider's model list into the cache the base picker uses.
+    models: {
+      input: obj({}),
+      output: obj({}, { additionalProperties: true }),
+    },
     // Valid values for one knob, with the current one marked.
     choices: {
       input: obj({ key: str() }, { required: ["key"] }),
@@ -67,6 +72,139 @@ export const FUSION_RPC = {
   },
 };
 
+// ---------------------------------------------------------- lead models --
+
+// Providers that run on the owner's own hardware (no per-token cost).
+const LOCAL_LEAD_PROVIDERS = ["llm-swap", "strata", "llamacpp"];
+
+// Effort ladder for a lead given as a raw provider/model id. The gateway
+// publishes no levels for new models, so this goes by vendor.
+export function vendorEfforts(model) {
+  const m = String(model).toLowerCase();
+  if (/anthropic|claude/.test(m)) return ["low", "medium", "high", "xhigh", "max"];
+  if (/openai|gpt-/.test(m)) return ["none", "low", "medium", "high", "xhigh", "max"];
+  if (/zai|glm|moonshot|kimi/.test(m)) return ["low", "high", "max"];
+  return [];
+}
+
+// A lead is an alias from `bases` or any "provider/model" id. Returns
+// { model, efforts, free? } or null.
+export function resolveBase(spec, bases) {
+  if (typeof spec !== "string" || !spec) return null;
+  if (bases[spec]) return bases[spec];
+  if (!/^[^/\s]+\/\S+$/.test(spec)) return null;
+  return { model: spec, efforts: vendorEfforts(spec), free: /^opencode\/.*-free$/.test(spec) };
+}
+
+// opencode's own favourites and recents (the model picker state file).
+export function readModelState(file) {
+  const f =
+    file ??
+    path.join(process.env.XDG_STATE_HOME || path.join(process.env.HOME || "", ".local/state"), "opencode/model.json");
+  try {
+    const j = JSON.parse(fs.readFileSync(f, "utf8"));
+    const ids = (list) =>
+      (Array.isArray(list) ? list : [])
+        .filter((m) => m?.providerID && m?.modelID)
+        .map((m) => `${m.providerID}/${m.modelID}`);
+    return { favorite: ids(j.favorite), recent: ids(j.recent) };
+  } catch {
+    return { favorite: [], recent: [] };
+  }
+}
+
+function leadFooter(model, free) {
+  if (free) return "free";
+  return LOCAL_LEAD_PROVIDERS.includes(String(model).split("/")[0]) ? "local" : "paid";
+}
+
+// Every model of every connected provider, as opencode's server lists it
+// (GET /api/model). Cached on disk: the picker reads the cache, and
+// `/fusion models` refreshes it.
+const xdg = (k, d) => process.env[k] || path.join(process.env.HOME || "", d);
+export const MODEL_CACHE = path.join(xdg("XDG_CACHE_HOME", ".cache"), "oc-fusion/models.json");
+const SERVICE_FILE = path.join(xdg("XDG_STATE_HOME", ".local/state"), "opencode/service.json");
+
+export function readModelCache(file = MODEL_CACHE) {
+  try {
+    const j = JSON.parse(fs.readFileSync(file, "utf8"));
+    return { fetched: j.fetched ?? 0, models: Array.isArray(j.models) ? j.models : [] };
+  } catch {
+    return { fetched: 0, models: [] };
+  }
+}
+
+// Normalise /api/model rows to { id: "provider/model", cost: [in, out] | null }.
+export function catalogRows(body) {
+  const list = Array.isArray(body) ? body : Array.isArray(body?.data) ? body.data : Array.isArray(body?.models) ? body.models : [];
+  const out = [];
+  for (const m of list) {
+    const provider = m?.providerID ?? m?.provider;
+    const id = m?.id ?? m?.modelID;
+    if (!provider || !id) continue;
+    const c = Array.isArray(m.cost) ? m.cost[0] : m.cost;
+    const cost = c && typeof c.input === "number" ? [c.input, c.output ?? 0] : null;
+    out.push({ id: `${provider}/${id}`, cost });
+  }
+  out.sort((a, b) => a.id.localeCompare(b.id));
+  return out;
+}
+
+export async function refreshModelCache({ directory, serviceFile = SERVICE_FILE, file = MODEL_CACHE, fetchImpl = fetch } = {}) {
+  let svc;
+  try {
+    svc = JSON.parse(fs.readFileSync(serviceFile, "utf8"));
+  } catch {
+    throw new Error(`no opencode service file at ${serviceFile}`);
+  }
+  const url = new URL("/api/model", svc.url);
+  if (directory) url.searchParams.set("location[directory]", directory);
+  const headers = svc.password
+    ? { authorization: "Basic " + Buffer.from(`opencode:${svc.password}`).toString("base64") }
+    : {};
+  const res = await fetchImpl(url, { headers, signal: AbortSignal.timeout(15000) });
+  if (!res.ok) throw new Error(`GET /api/model answered ${res.status}`);
+  const models = catalogRows(await res.json());
+  if (!models.length) throw new Error("GET /api/model returned no models");
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, JSON.stringify({ fetched: Date.now(), models }, null, 1));
+  return { count: models.length, providers: new Set(models.map((m) => m.id.split("/")[0])).size };
+}
+
+// Picker options: Favourites, Recent (opencode's own lists), then the curated
+// leads. A model that has an alias is offered under its alias. No duplicates.
+export function baseOptions(bases, state = { favorite: [], recent: [] }, recentMax = 8) {
+  const aliasOf = Object.fromEntries(Object.entries(bases).map(([k, b]) => [b.model, k]));
+  const seen = new Set();
+  const out = [];
+  const add = (spec, category) => {
+    const value = aliasOf[spec] ?? spec;
+    if (seen.has(value)) return;
+    const b = resolveBase(value, bases);
+    if (!b) return;
+    seen.add(value);
+    const rate = LEAD_RATES[value];
+    out.push({
+      value,
+      title: category.startsWith("All: ") ? value.slice(value.indexOf("/") + 1) : value,
+      description: b.model,
+      footer: rate && rate[0] > 0 ? `$${rate[0]}/$${rate[1]}` : leadFooter(b.model, b.free),
+      category,
+    });
+  };
+  for (const id of state.favorite ?? []) add(id, "Favourites");
+  for (const id of (state.recent ?? []).slice(0, recentMax)) add(id, "Recent");
+  for (const k of Object.keys(bases)) add(bases[k].model, "Lead models");
+  for (const m of state.all ?? []) {
+    const before = out.length;
+    add(m.id, `All: ${m.id.split("/")[0]}`);
+    if (out.length > before && m.cost && m.cost[0] > 0 && !LEAD_RATES[out.at(-1).value]) {
+      out.at(-1).footer = `$${m.cost[0]}/$${m.cost[1]}`;
+    }
+  }
+  return out;
+}
+
 // -------------------------------------------------------------- choices --
 
 // What each /fusion knob accepts. `set` validates against this table, and
@@ -76,13 +214,7 @@ export const KNOBS = {
   base: {
     label: "Lead model",
     help: "The model that plans and decides. Pick by budget and quality.",
-    options: (bases) =>
-      Object.entries(bases).map(([value, b]) => ({
-        value,
-        title: value,
-        description: b.model,
-        footer: b.free ? "free" : "paid",
-      })),
+    options: (bases, _sidekicks, state) => baseOptions(bases, state),
     write: "base",
   },
   sidekick: {
@@ -443,10 +575,12 @@ export const LEAD_RATES = {
   "union-alpha": [0, 0],
   glm: [0.7, 2.2],
   "glm-flash": [0.015, 0.05],
+  kimi: [2, 10],
+  sonnet: [2, 10],
+  opus: [4, 20],
   fable: [10, 50],
+  sol: [2, 10],
   astra: [10, 50],
-  sol: [5, 30],
-  opus: [5, 25],
 };
 
 export function usageTotals(rows, base = "glm") {
